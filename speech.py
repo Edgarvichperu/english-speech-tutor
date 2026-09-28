@@ -13,14 +13,14 @@ from google.genai import types
 from pydantic import BaseModel
 
 # ==============================================================================
-# 1. CONFIGURATION & PATHS
+# 1. CONFIGURACIÓN & RUTAS DE ALMACENAMIENTO
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "spanglish_adaptive_coach.db")
-st.set_page_config(page_title="🗣️ Spanglish Adaptive Coach", layout="wide", page_icon="☕")
+st.set_page_config(page_title="🗣️ Edgarvich says", layout="wide", page_icon="☕")
 
 # ==============================================================================
-# 2. LOCAL RESEARCH DATABASE (DIAGNOSTICS & ADAPTIVE ERROR RECYCLING)
+# 2. BASE DE DATOS LOCAL (DIAGNÓSTICO Y REGISTRO EN SEGUNDO PLANO)
 # ==============================================================================
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH, timeout=20.0)
@@ -62,7 +62,6 @@ def log_diagnostic_result(name, inp, feedback, topic, strengths, errors, mastery
         return None
 
 def get_student_unmastered_weaknesses(name, limit=3):
-    """Retrieves unresolved linguistic slips to inject into the tutor prompt."""
     try:
         conn = get_db_connection()
         query = """
@@ -74,11 +73,11 @@ def get_student_unmastered_weaknesses(name, limit=3):
         df = pd.read_sql_query(query, conn, params=(name, limit))
         conn.close()
         if df.empty:
-            return "No recorded persistent gaps. Maintain natural conversational immersion."
+            return "No recorded persistent gaps. Focus on natural scaffolding and clear English expressions."
         
         weakness_lines = []
         for _, row in df.iterrows():
-            weakness_lines.append(f"- Focus: {row['grammar_topic']} | Growth Area: {row['student_errors']}")
+            weakness_lines.append(f"- Implicit Target: {row['grammar_topic']} | Slip to recast: {row['student_errors']}")
         return "\n".join(weakness_lines)
     except Exception:
         return "Learner profile currently unavailable."
@@ -87,22 +86,32 @@ class PedagogicalDiagnosis(BaseModel):
     grammar_topic: str
     student_strengths: str
     student_errors: str
-    mastery_status: str  # 'needs_practice', 'emerging', 'mastered'
+    mastery_status: str
 
 # ==============================================================================
-# 3. STUDENT ROSTER INTEGRATION (GOOGLE SHEETS WITH LOCAL FALLBACK)
+# 3. GESTIÓN DE ROSTER Y LECTURA SEGURA DE GOOGLE SHEETS
 # ==============================================================================
-gsheet_conn = st.connection("gsheets", type=GSheetsConnection)
-
 def get_authorized_students() -> dict:
     try:
+        gsheet_conn = st.connection("gsheets", type=GSheetsConnection)
         df = gsheet_conn.read(ttl=0)
     except Exception:
+        df = None
+
+    if df is None or df.empty:
         try:
-            raw_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
-            sheet_id = raw_url.split("/d/")[1].split("/")[0]
-            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-            df = pd.read_csv(csv_url)
+            raw_url = None
+            try:
+                raw_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+            except Exception:
+                raw_url = None
+                
+            if raw_url and "/d/" in raw_url:
+                sheet_id = raw_url.split("/d/")[1].split("/")[0]
+                csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+                df = pd.read_csv(csv_url)
+            else:
+                return {"Edgar": "peru2026"}
         except Exception:
             return {"Edgar": "peru2026"}
 
@@ -118,34 +127,8 @@ def get_authorized_students() -> dict:
     except Exception:
         return {"Edgar": "peru2026"}
 
-def add_student_to_gsheet(name: str, pin: str) -> tuple[bool, str]:
-    try:
-        name_clean = str(name).strip()
-        pin_clean = str(pin).strip()
-        if not name_clean or not pin_clean:
-            return False, "Name and PIN are required."
-
-        df = gsheet_conn.read(ttl=0)
-        col_names = [str(c).strip().lower() for c in df.columns]
-        name_col_idx = next(i for i, c in enumerate(col_names) if any(k in c for k in ["name", "nombre", "student"]))
-        pin_col_idx = next(i for i, c in enumerate(col_names) if any(k in c for k in ["pin", "pass", "clave", "code"]))
-
-        actual_name_col = df.columns[name_col_idx]
-        actual_pin_col = df.columns[pin_col_idx]
-
-        existing = df[actual_name_col].dropna().astype(str).str.strip().str.lower().values
-        if name_clean.lower() in existing:
-            return False, f"Student '{name_clean}' is already registered."
-
-        new_row = pd.DataFrame([{actual_name_col: name_clean, actual_pin_col: pin_clean}])
-        updated_df = pd.concat([df, new_row], ignore_index=True)
-        gsheet_conn.update(data=updated_df)
-        return True, f"Student '{name_clean}' registered successfully!"
-    except Exception as e:
-        return False, f"Google Sheets write error: {e}"
-
 # ==============================================================================
-# 4. AUDIO ENGINE (BILINGUAL NATIVE WEB SPEECH API)
+# 4. MOTOR DE AUDIO 100% INGLÉS (VOZ NATIVA EN-US)
 # ==============================================================================
 def clean_for_speech(text):
     clean = re.sub(r'[\_\-\(\)\[\]\{\}\*\#\«\»\<\>\/\\]', ' ', text)
@@ -175,7 +158,7 @@ def render_communicative_audio(full_response_text, auto_play=True, key_suffix=""
             gap: 6px;
             font-weight: 500;
         ">
-            🔊 Listen to Full Audio
+            🔊 Listen to Audio
         </button>
     </div>
     <script>
@@ -190,8 +173,9 @@ def render_communicative_audio(full_response_text, auto_play=True, key_suffix=""
             synth.cancel();
 
             var voices = synth.getVoices();
-            var enVoice = voices.find(function(v) {{ return v.lang && (v.lang === "en-US" || v.lang.startsWith("en")); }}) || voices[0];
-            var esVoice = voices.find(function(v) {{ return v.lang && v.lang.toLowerCase().startsWith("es"); }}) || voices[0];
+            var enVoice = voices.find(function(v) {{ 
+                return v.lang && (v.lang === "en-US" || v.lang === "en_US" || v.lang.startsWith("en")); 
+            }}) || voices[0];
 
             if (!chunks || chunks.length === 0) return;
 
@@ -199,17 +183,9 @@ def render_communicative_audio(full_response_text, auto_play=True, key_suffix=""
             for (var i = 0; i < chunks.length; i++) {{
                 var text = chunks[i];
                 var utt = new SpeechSynthesisUtterance(text);
-                var spanishIndicators = text.match(/[áéíóúüñ¿¡]|\\b(el|la|los|las|un|una|ayer|hoy|mientras|vamos|amigos|casa)\\b/i);
-                
-                if (spanishIndicators) {{
-                    utt.voice = esVoice;
-                    utt.lang = "es-ES";
-                    utt.rate = 0.90;
-                }} else {{
-                    utt.voice = enVoice;
-                    utt.lang = "en-US";
-                    utt.rate = 0.94;
-                }}
+                utt.voice = enVoice;
+                utt.lang = "en-US";
+                utt.rate = 0.95;
                 utterances.push(utt);
             }}
 
@@ -243,7 +219,7 @@ def render_communicative_audio(full_response_text, auto_play=True, key_suffix=""
     components.html(html_code, height=45)
 
 # ==============================================================================
-# 5. RESILIENT GEMINI CALL HANDLERS
+# 5. CONTROLADOR RESILIENTE DE LLAMADAS GEMINI
 # ==============================================================================
 def stream_with_retry(client_obj, model_name, contents_list, cfg, retries=3, delay=2.5):
     for attempt in range(retries):
@@ -276,16 +252,24 @@ def generate_with_retry(client_obj, model_name, contents_val, cfg, retries=3, de
             raise e
 
 # ==============================================================================
-# 6. SIDEBAR (AUTHENTICATION & RESEARCH DASHBOARD)
+# 6. BARRA LATERAL (AUTENTICACIÓN, SECRETS Y ANALÍTICA)
 # ==============================================================================
 with st.sidebar:
-    st.title("🗣️ Spanglish Coach")
+    st.title("🗣️ Edgarvich says")
     
-    if "GEMINI_API_KEY" in st.secrets:
-        gemini_api_key = st.secrets["GEMINI_API_KEY"]
-    else:
+    gemini_api_key = None
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            gemini_api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        gemini_api_key = None
+
+    if not gemini_api_key:
+        gemini_api_key = os.environ.get("GEMINI_API_KEY")
+
+    if not gemini_api_key:
         api_key_input = st.text_input("🔑 Gemini API Key:", type="password")
-        gemini_api_key = api_key_input or os.environ.get("GEMINI_API_KEY")
+        gemini_api_key = api_key_input
 
     st.divider()
     st.subheader("🔐 Student Login (Google Sheets)")
@@ -318,6 +302,7 @@ with st.sidebar:
     st.divider()
     if st.button("🔄 Reset Conversation"):
         st.session_state.messages = []
+        st.session_state.last_audio_bytes = None
         st.rerun()
 
     instructor_key = st.text_input("Instructor Access:", type="password")
@@ -334,9 +319,9 @@ with st.sidebar:
             st.dataframe(df, use_container_width=True)
 
 # ==============================================================================
-# 7. MAIN SESSION & ONBOARDING STARTER
+# 7. SESIÓN PRINCIPAL & ONBOARDING
 # ==============================================================================
-st.title("🗣️ Spanglish Communicative Roleplay")
+st.title("🗣️ Edgarvich says")
 
 if not gemini_api_key:
     st.warning("👈 Please enter or configure your GEMINI_API_KEY in the sidebar to begin.")
@@ -354,13 +339,15 @@ client = get_gemini_client(gemini_api_key)
 student_first_name = selected_student.split()[0]
 
 INITIAL_GREETING = (
-    f"¡Hola, {student_first_name}! Welcome to your Spanglish conversation practice! ☕✨\n\n"
-    "I'm your communicative coach, and we are going to practice real-life conversational fluency together.\n\n"
-    "To begin, **which tense would you like to practice today?**\n\n"
-    "1. **Present Tense** *(Daily routines, campus life, habits)*\n"
-    "2. **Past Tense** *(Memorable trips, weekend stories, past experiences)*\n"
-    "3. **Future Tense** *(Upcoming plans, future travels, study goals)*\n\n"
-    "👉 **Your Turn:** Reply with **1, 2, or 3** (or tell me your choice) to jump right into our scenario!"
+    f"Hello {student_first_name}! Welcome to your spoken English conversation practice! ☕\n\n"
+    "We are going to practice real everyday spoken English in a relaxed chat. "
+    "**You can speak using the microphone below or type your answer in the chat box!** "
+    "If you ever don't know how to say something, just ask in Spanish and I will show you how to say it in English.\n\n"
+    "To begin, **what would you like to talk about today?**\n\n"
+    "1. **Your Daily Routine** (what time you wake up, classes, what you do each day)\n"
+    "2. **A Memorable Trip or Vacation** (a place you visited in the past and what you did)\n"
+    "3. **Your Future Plans** (places you want to travel to, upcoming goals)\n\n"
+    "👉 **Your Turn:** Speak or write **1, 2, or 3** to start!"
 )
 
 if 'messages' not in st.session_state or st.session_state.get("active_user") != selected_student or not st.session_state.get("messages"):
@@ -370,10 +357,14 @@ if 'messages' not in st.session_state or st.session_state.get("active_user") != 
         "content": INITIAL_GREETING,
         "auto_play": True
     }]
+    st.session_state.last_audio_bytes = None
 
+# Renderizar el historial de conversación
 for idx, m in enumerate(st.session_state.messages):
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
+        if m.get("audio_data"):
+            st.audio(m["audio_data"], format="audio/wav")
         if m["role"] == "assistant" and m.get("content"):
             render_communicative_audio(
                 m["content"], 
@@ -382,42 +373,67 @@ for idx, m in enumerate(st.session_state.messages):
             )
             m["auto_play"] = False
 
-st.info("💡 **Fluency Mode:** Natural Spanglish roleplay (A2–B2). If you need help, just ask for a clue or translation!")
+# ==============================================================================
+# 8. ENTRADA DE USUARIO (MICRÓFONO DIRECTO O TEXTO)
+# ==============================================================================
+st.write("---")
+col_audio, col_info = st.columns([1, 2])
+with col_audio:
+    recorded_audio = st.audio_input("🎙️ Speak your answer (Record & Send):")
+with col_info:
+    st.caption("💡 **Tip:** Press record to speak in English or ask in Spanish. Press stop to send directly!")
+
+text_input = st.chat_input("Or type your message here if you prefer typing...")
+
+incoming_text = None
+incoming_audio_bytes = None
+
+if recorded_audio is not None:
+    audio_bytes = recorded_audio.getvalue()
+    if audio_bytes != st.session_state.get("last_audio_bytes"):
+        st.session_state.last_audio_bytes = audio_bytes
+        incoming_audio_bytes = audio_bytes
+        incoming_text = "🎙️ [Audio Voice Message]"
+
+if text_input:
+    incoming_text = text_input
 
 # ==============================================================================
-# 8. ADAPTIVE PEDAGOGICAL ENGINE
+# 9. MOTOR PEDAGÓGICO: ENFOQUE EN LA TRADUCCIÓN/SCAFFOLDING DEL TUTOR
 # ==============================================================================
-user_input = st.chat_input("Write your response or ask for clarification...")
+if incoming_text:
+    user_entry = {"role": "user", "content": incoming_text}
+    if incoming_audio_bytes:
+        user_entry["audio_data"] = incoming_audio_bytes
+    st.session_state.messages.append(user_entry)
 
-if user_input:
-    st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
-        st.markdown(user_input)
+        st.markdown(incoming_text)
+        if incoming_audio_bytes:
+            st.audio(incoming_audio_bytes, format="audio/wav")
 
     learner_weaknesses = get_student_unmastered_weaknesses(selected_student)
 
     system_instruction = (
-        f"You are an expert language educator facilitating Spanglish conversation practice with adaptive scaffolding.\n"
-        f"Active Student: {selected_student} ('{student_first_name}').\n\n"
-        f"LEARNER DIAGNOSTIC PROFILE (RECURRENT WEAK SPOTS TO RECYCLE NATURALLY):\n"
+        f"You are a friendly, expert English conversation partner helping an adult learner ({selected_student}, called '{student_first_name}') build spoken English fluency.\n\n"
+        f"DIAGNOSTIC TARGETS (RECYCLE IMPLICITLY WITHOUT EXPLANATION):\n"
         f"{learner_weaknesses}\n\n"
-        "PEDAGOGICAL & INTERACTION RULES (CEFR A2 TO B2):\n"
-        "1. WELCOME & SELECTION:\n"
-        "   - The initial greeting gave three options (1. Present, 2. Past, 3. Future).\n"
-        "   - As soon as the student chooses a tense, immediately adopt a supportive conversational persona and launch an everyday, real-world roleplay scenario.\n"
-        "2. ROLEPLAY CONTEXTS:\n"
-        "   - Strictly restrict scenarios to everyday university life, campus routines, community activities, tourism, studying, dining out, or travel.\n"
-        "   - Engage using natural, expressive Spanglish code-switching to model communicative ease.\n"
-        "3. ERROR RECYCLING & SCAFFOLDING:\n"
-        "   - Implicitly weave opportunities into the dialogue for the student to practice their recorded weak spots.\n"
-        "   - Do NOT say 'You made an error on X before.' Instead, guide the situation so the natural reply requires that structure.\n"
-        "   - When the student makes an error, praise the communicative attempt first, then provide a gentle recast or sentence model.\n"
-        "4. TRANSLATIONS & CLARIFICATIONS:\n"
-        "   - If the student asks for a Spanish translation or grammar clarification, provide it briefly in simple English (maximum 1-2 lines).\n"
-        "   - Immediately steer the conversation back into English/Spanglish with an open-ended communicative follow-up question.\n"
-        "5. CONSTRAINTS:\n"
-        "   - Keep language accessible (A2–B2) with zero heavy linguistic meta-jargon.\n"
-        "   - Always conclude with an engaging question to keep the roleplay moving."
+        "STRICT PEDAGOGICAL & SCAFFOLDING RULES (TARGET CEFR A2–B1):\n"
+        "1. THE TUTOR'S ENGLISH TRANSLATION & MODELING IS CRUCIAL:\n"
+        "   - The student is fully welcome to speak or write in Spanish or Spanglish whenever they are stuck or asking 'cómo se dice...'.\n"
+        "   - Whenever the student uses Spanish or expresses a doubt, IMMEDIATELY show them how to express that in natural English.\n"
+        "     Example: Student says 'Ayer me quedé dormido y no sé cómo se dice.'\n"
+        "     Tutor: 'In English, you can say: \"Yesterday, I overslept!\" Did your alarm not go off?'\n"
+        "   - Always provide the natural, communicative English translation/expression right at the beginning of your response.\n\n"
+        "2. ACCESSIBLE & CLEAR INTERNATIONAL VOCABULARY (NO HARD IDIOMS):\n"
+        "   - Strictly avoid obscure American idioms or slang (no 'early bird', 'hit the snooze button', 'under the weather', 'spill the tea').\n"
+        "   - Use transparent, clear English vocabulary that is easy to understand and speak aloud.\n\n"
+        "3. VOICE SYNTHESIS READY (NO SPANISH PUNCTUATION IN AUDIO):\n"
+        "   - Your spoken audio must sound natural in English (en-US). Do NOT use inverted punctuation like '¡' or '¿'.\n\n"
+        "4. SHORT TURNS & NATURAL RECASTING:\n"
+        "   - Keep your responses concise (2 to 3 sentences).\n"
+        "   - If the student makes an English slip, recast it naturally into your response.\n"
+        "   - Always finish with ONE simple, direct question so the student can reply immediately."
     )
 
     with st.chat_message("assistant"):
@@ -427,7 +443,13 @@ if user_input:
                 content_text = msg.get("content", "")
                 if content_text and not content_text.startswith("🚨"):
                     role = "user" if msg["role"] == "user" else "model"
-                    contents.append(types.Content(role=role, parts=[types.Part.from_text(text=content_text)]))
+                    parts = []
+                    if msg.get("audio_data"):
+                        parts.append(types.Part.from_bytes(data=msg["audio_data"], mime_type="audio/wav"))
+                        parts.append(types.Part.from_text(text="[Listen to the student's spoken audio. If they spoke in Spanish or expressed doubt, provide the exact English expression/translation immediately, recast any slips, and ask a follow-up question.]"))
+                    else:
+                        parts.append(types.Part.from_text(text=content_text))
+                    contents.append(types.Content(role=role, parts=parts))
 
             if pdf_bytes:
                 contents[-1].parts.insert(0, types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"))
@@ -436,14 +458,14 @@ if user_input:
 
             fast_config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                max_output_tokens=1024,
+                max_output_tokens=400,
                 temperature=0.6
             )
 
             def stream_response():
                 response = stream_with_retry(
                     client_obj=client,
-                    model_name='gemini-2.5-flash',
+                    model_name='gemini-3.8-flash',
                     contents_list=contents,
                     cfg=fast_config,
                     retries=3,
@@ -456,29 +478,29 @@ if user_input:
             student_response = st.write_stream(stream_response)
 
             record_id = log_diagnostic_result(
-                selected_student, user_input, student_response, 
+                selected_student, incoming_text, student_response, 
                 "Analyzing...", "Analyzing...", "Analyzing...", "emerging",
                 "YES" if uploaded_file else "NO"
             )
 
-            # Asynchronous background pedagogical evaluation
-            def run_background_analysis(rec_id, query, resp, student_name):
+            # Diagnóstico pedagógico invisible en segundo plano (para la analítica docente)
+            def run_background_analysis(rec_id, query_content, resp, student_name):
                 if not rec_id:
                     return
                 try:
                     analysis_prompt = (
-                        f"Analyze this Spanglish learner interaction for diagnostic tracking.\n"
-                        f"Student text: '{query}'\n"
-                        f"Coach response: '{resp}'\n\n"
+                        f"Analyze this oral language interaction strictly for instructor analytics.\n"
+                        f"Student input summary: '{query_content}'\n"
+                        f"Tutor response: '{resp}'\n\n"
                         "Extract JSON with keys:\n"
-                        "- grammar_topic: Specific tense or structure addressed.\n"
-                        "- student_strengths: What the student did well.\n"
-                        "- student_errors: Clear mistake or transfer slip (or 'None' if accurate).\n"
-                        "- mastery_status: 'needs_practice' (if clear errors occurred), 'emerging' (if supported), or 'mastered' (accurate free production)."
+                        "- grammar_topic: Target structure or tense.\n"
+                        "- student_strengths: Oral fluency strengths or vocabulary used.\n"
+                        "- student_errors: Slip or transfer error made (or 'None' if accurate).\n"
+                        "- mastery_status: 'needs_practice', 'emerging', or 'mastered'."
                     )
                     analysis_res = generate_with_retry(
                         client_obj=client,
-                        model_name='gemini-2.5-flash',
+                        model_name='gemini-3.8-flash',
                         contents_val=analysis_prompt,
                         cfg=types.GenerateContentConfig(
                             response_mime_type="application/json",
@@ -496,9 +518,9 @@ if user_input:
                             SET grammar_topic = ?, student_strengths = ?, student_errors = ?, mastery_status = ?
                             WHERE id = ?
                         """, (
-                            diag_data.get("grammar_topic", "Spanglish Fluency"), 
-                            diag_data.get("student_strengths", "Communicative Effort"), 
-                            diag_data.get("student_errors", "Minor code-switching slip"), 
+                            diag_data.get("grammar_topic", "Oral Fluency"), 
+                            diag_data.get("student_strengths", "Spoken Interaction"), 
+                            diag_data.get("student_errors", "Minor oral slip"), 
                             diag_data.get("mastery_status", "needs_practice"),
                             rec_id
                         ))
@@ -508,7 +530,7 @@ if user_input:
 
             threading.Thread(
                 target=run_background_analysis,
-                args=(record_id, user_input, student_response, selected_student),
+                args=(record_id, incoming_text, student_response, selected_student),
                 daemon=True
             ).start()
 

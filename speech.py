@@ -6,11 +6,9 @@ import time
 import pandas as pd
 import streamlit.components.v1 as components
 import json
-import threading
 from streamlit_gsheets import GSheetsConnection
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
 
 # ==============================================================================
 # 1. CONFIGURACIÓN & RUTAS DE ALMACENAMIENTO
@@ -25,12 +23,13 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# 2. BASE DE DATOS LOCAL (DIAGNÓSTICO Y REGISTRO PEDAGÓGICO)
+# 2. BASE DE DATOS LOCAL (DIAGNÓSTICO PEDAGÓGICO CON MIGRACIÓN AUTOMÁTICA)
 # ==============================================================================
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
-        conn.execute("PRAGMA journal_mode=DELETE;")
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
     except Exception:
         pass
     return conn
@@ -44,56 +43,74 @@ def init_db():
                        student_input TEXT, 
                        ai_feedback TEXT, 
                        grammar_topic TEXT, 
-                       student_strengths TEXT, 
-                       student_errors TEXT, 
+                       pedagogical_analysis TEXT, 
                        mastery_status TEXT, 
                        used_pdf TEXT, 
                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        
+        # Migración segura: agregar 'pedagogical_analysis' si la tabla ya existía
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(diagnostics)")
+        cols = [col[1] for col in cursor.fetchall()]
+        if "pedagogical_analysis" not in cols:
+            try:
+                conn.execute("ALTER TABLE diagnostics ADD COLUMN pedagogical_analysis TEXT")
+            except Exception:
+                pass
     conn.close()
 
 init_db()
 
-def log_diagnostic_result(name, inp, feedback, topic, strengths, errors, mastery_status, used_pdf):
+def log_diagnostic_result(name, inp, feedback, topic, analysis, mastery_status, used_pdf):
     try:
         conn = get_db_connection()
         with conn:
             cursor = conn.cursor()
-            cursor.execute("""INSERT INTO diagnostics 
-                          (student_name, student_input, ai_feedback, grammar_topic, student_strengths, student_errors, mastery_status, used_pdf) 
-                          VALUES (?,?,?,?,?,?,?,?)""",
-                          (name, inp, feedback, topic, strengths, errors, mastery_status, used_pdf))
+            cursor.execute("PRAGMA table_info(diagnostics)")
+            cols = [col[1] for col in cursor.fetchall()]
+            
+            if "pedagogical_analysis" in cols:
+                cursor.execute("""INSERT INTO diagnostics 
+                              (student_name, student_input, ai_feedback, grammar_topic, pedagogical_analysis, mastery_status, used_pdf) 
+                              VALUES (?,?,?,?,?,?,?)""",
+                              (name, inp, feedback, topic, analysis, mastery_status, used_pdf))
+            else:
+                cursor.execute("""INSERT INTO diagnostics 
+                              (student_name, student_input, ai_feedback, grammar_topic, student_strengths, student_errors, mastery_status, used_pdf) 
+                              VALUES (?,?,?,?,?,?,?,?)""",
+                              (name, inp, feedback, topic, analysis, "None", mastery_status, used_pdf))
             inserted_id = cursor.lastrowid
         conn.close()
         return inserted_id
-    except sqlite3.OperationalError:
+    except Exception as e:
+        print(f"❌ Error al guardar log en SQLite: {e}")
         return None
 
 def get_student_unmastered_weaknesses(name, limit=3):
     try:
         conn = get_db_connection()
-        query = """
-            SELECT grammar_topic, student_errors 
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(diagnostics)")
+        cols = [col[1] for col in cursor.fetchall()]
+        analysis_col = "pedagogical_analysis" if "pedagogical_analysis" in cols else "student_errors"
+
+        query = f"""
+            SELECT grammar_topic, {analysis_col} 
             FROM diagnostics 
-            WHERE student_name = ? AND grammar_topic != 'Analyzing...' AND mastery_status != 'mastered'
+            WHERE student_name = ? AND grammar_topic NOT IN ('Analyzing...', 'General Conversation') AND mastery_status != 'mastered'
             ORDER BY id DESC LIMIT ?
         """
         df = pd.read_sql_query(query, conn, params=(name, limit))
         conn.close()
         if df.empty:
-            return "Beginner A1 English learner. Focus on natural scaffolding and clear sentence models."
+            return "Beginner A1-A2 English learner. Focus on natural communication and clear sentence models."
         
         weakness_lines = []
         for _, row in df.iterrows():
-            weakness_lines.append(f"- Focus Target: {row['grammar_topic']} | Recent slip: {row['student_errors']}")
+            weakness_lines.append(f"- Focus Target: {row['grammar_topic']} | Note: {row[analysis_col]}")
         return "\n".join(weakness_lines)
     except Exception:
         return "Learner profile currently initializing."
-
-class PedagogicalDiagnosis(BaseModel):
-    grammar_topic: str
-    student_strengths: str
-    student_errors: str
-    mastery_status: str
 
 # ==============================================================================
 # 3. GESTIÓN DE ROSTER Y LECTURA SEGURA DE GOOGLE SHEETS
@@ -232,7 +249,7 @@ def render_communicative_audio(full_response_text, auto_play=True, key_suffix=""
 # ==============================================================================
 # 5. CONTROLADOR RESILIENTE DE LLAMADAS GEMINI
 # ==============================================================================
-def stream_with_retry(client_obj, model_name, contents_list, cfg, retries=3, delay=2.5):
+def stream_with_retry(client_obj, model_name, contents_list, cfg, retries=3, delay=2.0):
     for attempt in range(retries):
         try:
             return client_obj.models.generate_content_stream(
@@ -247,7 +264,7 @@ def stream_with_retry(client_obj, model_name, contents_list, cfg, retries=3, del
                 continue
             raise e
 
-def generate_with_retry(client_obj, model_name, contents_val, cfg, retries=3, delay=2.5):
+def generate_with_retry(client_obj, model_name, contents_val, cfg, retries=3, delay=2.0):
     for attempt in range(retries):
         try:
             return client_obj.models.generate_content(
@@ -321,21 +338,21 @@ with st.sidebar:
     if instructor_key == "peru2026":
         st.subheader("👨‍🏫 Instructor Control Panel")
         with st.expander("📊 Student Oral Progress & Diagnostics Ledger", expanded=True):
+            if st.button("🔄 Refresh Analytics Table"):
+                st.rerun()
+
             conn = get_db_connection()
-            df = pd.read_sql_query("""
-                SELECT 
-                    id, 
-                    student_name, 
-                    grammar_topic, 
-                    student_errors, 
-                    student_strengths, 
-                    mastery_status, 
-                    student_input, 
-                    ai_feedback, 
-                    timestamp 
-                FROM diagnostics 
-                ORDER BY timestamp DESC
-            """, conn)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(diagnostics)")
+            col_names = [col[1] for col in cursor.fetchall()]
+
+            # Seleccionar las columnas disponibles en la base de datos local
+            if "pedagogical_analysis" in col_names:
+                query_cols = "id, student_name, grammar_topic, pedagogical_analysis, mastery_status, student_input, ai_feedback, timestamp"
+            else:
+                query_cols = "id, student_name, grammar_topic, student_strengths AS pedagogical_analysis, mastery_status, student_input, ai_feedback, timestamp"
+
+            df = pd.read_sql_query(f"SELECT {query_cols} FROM diagnostics ORDER BY timestamp DESC", conn)
             conn.close()
 
             all_students = ["All"] + sorted([s for s in df["student_name"].dropna().unique() if s])
@@ -350,18 +367,19 @@ with st.sidebar:
                 st.metric("Total Exchanges", len(df_display))
             with col_m2:
                 top_topic = df_display["grammar_topic"].mode()[0] if not df_display.empty else "N/A"
-                st.metric("Main Focus", top_topic)
+                st.metric("Main Focus Topic", top_topic)
+
+            cols_config = {
+                "grammar_topic": st.column_config.TextColumn("Target Topic", width="medium"),
+                "pedagogical_analysis": st.column_config.TextColumn("Pedagogical Analysis", width="large"),
+                "mastery_status": st.column_config.TextColumn("Status", width="small"),
+                "student_input": st.column_config.TextColumn("Student Utterance / Question", width="medium"),
+                "ai_feedback": st.column_config.TextColumn("Tutor Output", width="large"),
+            }
 
             st.dataframe(
                 df_display,
-                column_config={
-                    "grammar_topic": st.column_config.TextColumn("Target Topic", width="medium"),
-                    "student_errors": st.column_config.TextColumn("Growth Areas / Slips", width="large"),
-                    "student_strengths": st.column_config.TextColumn("Strengths", width="medium"),
-                    "mastery_status": st.column_config.TextColumn("Status", width="small"),
-                    "student_input": st.column_config.TextColumn("Student Utterance", width="medium"),
-                    "ai_feedback": st.column_config.TextColumn("Tutor Output", width="large"),
-                },
+                column_config=cols_config,
                 hide_index=True,
                 use_container_width=True
             )
@@ -468,7 +486,7 @@ if text_input:
     incoming_text = text_input
 
 # ==============================================================================
-# 9. MOTOR PEDAGÓGICO: COMUNICATIVO, RELEVANTE & ANDAMIAJE FONF COMPLETO
+# 9. MOTOR PEDAGÓGICO: COMUNICATIVO & ADAPTATIVO A PREGUNTAS Y TEMAS
 # ==============================================================================
 if incoming_text:
     user_entry = {"role": "user", "content": incoming_text}
@@ -487,33 +505,30 @@ if incoming_text:
         f"You are Edgarvich, a warm, encouraging English conversation coach helping {selected_student} ('{student_first_name}').\n"
         f"Learner profile context / targets:\n{learner_weaknesses}\n\n"
         "PEDAGOGICAL & INTERACTION RULES:\n"
-        "1. TOPIC SELECTION PROTOCOL (IMMEDIATE START):\n"
-        "   If the student sends '1', '2', or '3' (or names one of the topics from the greeting):\n"
-        "   - DO NOT repeat greetings, say welcome again, or ask what they want to practice.\n"
-        "   - Jump directly into that chosen topic with an encouraging sentence and ONE direct prompt:\n"
-        "     * If 1 (Introduce myself): Ask their name, city, and one simple thing they like.\n"
-        "     * If 2 (Favorites): Ask what their favorite food or weekend hobby is.\n"
-        "     * If 3 (Plans): Ask what they plan to do tomorrow.\n\n"
-        "2. GRAMMAR EXPLANATIONS VS. CONVERSATIONAL SLIPS (FOCUS ON FORM):\n"
-        "   - IF THE STUDENT ASKS A DIRECT GRAMMAR QUESTION (e.g., '¿Cómo formo el pasado?', 'Why use did?', 'When do I use in/at?'):\n"
-        "     * Answer clearly and concisely (in simple English or Spanish if asked in Spanish).\n"
-        "     * Give 1-2 practical, natural examples.\n"
-        "     * Provide a clear prompt or sentence starter so they can apply it immediately in the conversation.\n"
-        "   - IF THE STUDENT IS SIMPLY CONVERSING AND MAKES A MISTAKE OR SLIP (e.g., 'I was use to adapted to it'):\n"
-        "     * DO NOT give long grammar lectures or explain theoretical rules.\n"
-        "     * Provide the natural, accurate phrasing directly in bold on its own line:\n"
+        "1. TOPIC & QUESTION AWARENESS (IMMEDIATE RECOGNITION):\n"
+        "   - If the student asks about a specific grammar topic or tense (e.g., Future with 'will' or 'going to', Past tenses, Conditionals, Prepositions):\n"
+        "     * IMMEDIATELY address their specific topic and answer clearly.\n"
+        "     * Give 1-2 clear, simple examples.\n"
+        "     * Ask an engaging question inviting them to practice that topic.\n"
+        "   - If the student selects '1', '2', or '3':\n"
+        "     * DO NOT repeat the greetings or ask what they want to practice.\n"
+        "     * Launch the chosen topic directly (1: Intro, 2: Favorites, 3: Plans/Future tomorrow).\n\n"
+        "2. COMMUNICATIVE FEEDBACK (FOCUS ON FORM):\n"
+        "   - When the student converses and makes an error or awkward phrasing:\n"
+        "     * Do NOT give lengthy grammar lectures.\n"
+        "     * Provide the natural version directly in bold on its own line:\n"
         "       👉 **Natural way to say it:** [Polished natural sentence]\n"
-        "     * Acknowledge their message warmly before continuing the dialogue.\n\n"
+        "     * Acknowledge meaning warmly and keep the dialogue flowing.\n\n"
         "3. COMPLETE SENTENCE MODELS (NEVER TRUNCATE):\n"
-        "   - Whenever helpful or when introducing a target structure, provide finished sentence models that the student can practice aloud:\n"
+        "   - Whenever helpful, provide finished sentence models they can say aloud:\n"
         "     You can say:\n"
         "     • \"[Complete Model 1]\"\n"
         "     • \"[Complete Model 2]\"\n\n"
         "4. NATURAL SPANISH-TO-ENGLISH BRIDGE:\n"
-        "   - If the student speaks or writes in Spanish, bridge it into English naturally and provide concise clarifications.\n\n"
+        "   - If the student uses Spanish, translate key parts and bridge into English encouragingly.\n\n"
         "5. FAST & NATURAL AUDIO READY:\n"
-        "   - Keep responses concise (3-5 sentences total) to avoid mid-sentence cuts and ensure high conversational pace.\n"
-        "   - Avoid inverted Spanish punctuation ('¡', '¿') so the en-US text-to-speech engine speaks naturally."
+        "   - Keep responses within 3 to 5 sentences total to maintain high pace and prevent cuts.\n"
+        "   - Avoid inverted Spanish punctuation ('¡', '¿') so en-US TTS reads smoothly."
     )
 
     with st.chat_message("assistant"):
@@ -526,7 +541,7 @@ if incoming_text:
                     parts = []
                     if msg.get("audio_data"):
                         parts.append(types.Part.from_bytes(data=msg["audio_data"], mime_type="audio/wav"))
-                        parts.append(types.Part.from_text(text="[Listen to student audio. Respond in natural English, explain grammar directly if asked, provide natural reformulations for slips, and ask one engaging follow-up question.]"))
+                        parts.append(types.Part.from_text(text="[Listen to student audio. Answer questions directly, model natural English, and ask a follow-up question.]"))
                     else:
                         parts.append(types.Part.from_text(text=content_text))
                     contents.append(types.Content(role=role, parts=parts))
@@ -556,66 +571,58 @@ if incoming_text:
 
             student_response = st.write_stream(stream_response)
 
-            record_id = log_diagnostic_result(
+            # ==================================================================
+            # ANÁLISIS PEDAGÓGICO DIRECTO (SIN DEPENDENCIAS RÍGIDAS DE PYDANTIC)
+            # ==================================================================
+            grammar_topic = "General Conversation"
+            pedagogical_analysis = "Communicative interaction"
+            mastery_status = "needs_practice"
+
+            try:
+                analysis_prompt = (
+                    "You are an Applied Linguistics expert analyzing an English learner interaction.\n"
+                    "Analyze the following student utterance and tutor response:\n\n"
+                    f"Student Utterance: \"{incoming_text}\"\n"
+                    f"Tutor Response: \"{student_response}\"\n\n"
+                    "Return a JSON object with EXACTLY these three keys:\n"
+                    "{\n"
+                    "  \"grammar_topic\": \"<Specific topic name. Examples: 'Future (Will / Going to)', 'Present Perfect', 'Past Habitual (Used to)', 'Simple Past', 'Daily Routines', 'Questions with Do/Did'>\",\n"
+                    "  \"pedagogical_analysis\": \"<Concise description of the student's attempt, question asked, or specific slip corrected>\",\n"
+                    "  \"mastery_status\": \"<needs_practice, emerging, or mastered>\"\n"
+                    "}\n"
+                    "Do NOT output vague generalities. Detect the real topic of the question or sentence."
+                )
+
+                analysis_res = generate_with_retry(
+                    client_obj=client,
+                    model_name='gemini-3.8-flash',
+                    contents_val=analysis_prompt,
+                    cfg=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        max_output_tokens=300
+                    ),
+                    retries=2,
+                    delay=1.5
+                )
+
+                raw_text = str(analysis_res.text).strip()
+                match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                if match:
+                    parsed_json = json.loads(match.group(0))
+                    grammar_topic = parsed_json.get("grammar_topic", grammar_topic)
+                    pedagogical_analysis = parsed_json.get("pedagogical_analysis", pedagogical_analysis)
+                    mastery_status = parsed_json.get("mastery_status", mastery_status)
+            except Exception as ex:
+                print(f"❌ Error en extracción JSON de diagnóstico: {ex}")
+
+            # Guardado directo en SQLite
+            log_diagnostic_result(
                 selected_student, incoming_text, student_response, 
-                "Analyzing...", "Analyzing...", "Analyzing...", "needs_practice",
+                grammar_topic, pedagogical_analysis, mastery_status,
                 "YES" if uploaded_file else "NO"
             )
 
-            # ==================================================================
-            # ANÁLISIS EN SEGUNDO PLANO CORREGIDO (daemon=False + logs de depuración)
-            # ==================================================================
-            def run_background_analysis(rec_id, query_content, resp, student_name):
-                if not rec_id:
-                    return
-                try:
-                    analysis_prompt = (
-                        f"Analyze this oral language interaction strictly for English instructor analytics.\n"
-                        f"Student input: '{query_content}'\n"
-                        f"Tutor response: '{resp}'\n\n"
-                        "Extract JSON with keys:\n"
-                        "- grammar_topic: Target structure or tense discussed.\n"
-                        "- student_strengths: Oral fluency attempt or vocabulary used.\n"
-                        "- student_errors: Slip or transfer error made (or 'None' if accurate).\n"
-                        "- mastery_status: 'needs_practice', 'emerging', or 'mastered'."
-                    )
-                    analysis_res = generate_with_retry(
-                        client_obj=client,
-                        model_name='gemini-3.8-flash',
-                        contents_val=analysis_prompt,
-                        cfg=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=PedagogicalDiagnosis,
-                            max_output_tokens=250
-                        ),
-                        retries=3,
-                        delay=2.0
-                    )
-                    diag_data = json.loads(analysis_res.text)
-                    conn = get_db_connection()
-                    with conn:
-                        conn.execute("""
-                            UPDATE diagnostics 
-                            SET grammar_topic = ?, student_strengths = ?, student_errors = ?, mastery_status = ?
-                            WHERE id = ?
-                        """, (
-                            diag_data.get("grammar_topic", "English Oral Practice"), 
-                            diag_data.get("student_strengths", "Communicative attempt"), 
-                            diag_data.get("student_errors", "Minor oral slip"), 
-                            diag_data.get("mastery_status", "needs_practice"),
-                            rec_id
-                        ))
-                    conn.close()
-                except Exception as e:
-                    print(f"❌ Error en análisis diagnóstico en segundo plano: {e}")
-
-            # daemon=False garantiza que el hilo termine incluso al dispararse st.rerun()
-            threading.Thread(
-                target=run_background_analysis,
-                args=(record_id, incoming_text, student_response, selected_student),
-                daemon=False
-            ).start()
-
+            # Actualizar estado y refrescar
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": student_response,

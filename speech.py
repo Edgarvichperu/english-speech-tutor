@@ -1,29 +1,122 @@
-import streamlit as st
-import sqlite3
+import copy
+import hmac
+import json
 import os
 import re
+import sqlite3
 import time
+import urllib.parse
+from io import BytesIO
+
 import pandas as pd
-import streamlit.components.v1 as components
-import json
-from streamlit_gsheets import GSheetsConnection
+import pypdf
+import streamlit as st
 from google import genai
 from google.genai import types
+from gtts import gTTS
+from streamlit_gsheets import GSheetsConnection
 
 # ==============================================================================
-# 1. CONFIGURACIÓN & RUTAS DE ALMACENAMIENTO
+# 1. CONFIGURACIÓN GENERAL
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "english_a1_coach.db")
+DB_PATH = os.path.join(BASE_DIR, "english_progress.db")
 
 st.set_page_config(
-    page_title="🗣️ Edgarvich Tutor de Ingles107", 
-    layout="wide", 
-    page_icon="🎓"
+    page_title="🧠 Edgarvich Progressive SLA Tutor",
+    layout="wide",
+    page_icon="🎓",
 )
 
+# Archivo en Drive: "speech English107_database"
+# Columnas del roster: student_name | student_pin
+# El archivo se identifica por su URL/ID (no por su nombre). Define la URL en los Secrets:
+#   [connections.gsheets]
+#   spreadsheet = "https://docs.google.com/spreadsheets/d/TU_ID/edit"
+ROSTER_TAB = "roster"  # si no existe una pestaña con este nombre, se usa la primera pestaña
+LEDGER_TAB = "diagnostics_ledger"
+LEDGER_COLUMNS = [
+    "student_name", "cefr_level", "phase", "student_input",
+    "ai_feedback", "score_status", "timestamp",
+]
+MAX_ATTEMPTS = 2  # intentos por pregunta antes de mostrar la respuesta
+LEVELS = ["A1", "A2", "B1", "B2"]
+
+
+def _secret(name, default=None):
+    """Lee de st.secrets o de variables de entorno, sin romper si no existen."""
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
+def get_spreadsheet_url() -> str:
+    try:
+        return st.secrets["connections"]["gsheets"]["spreadsheet"]
+    except Exception:
+        return _secret("SPREADSHEET_URL", "") or ""
+
+
+SPREADSHEET_URL = get_spreadsheet_url()
+MODEL_NAME = _secret("MODEL_NAME", "gemini-3.8-flash")
+INSTRUCTOR_KEY = _secret("INSTRUCTOR_KEY")
+
 # ==============================================================================
-# 2. BASE DE DATOS LOCAL (DIAGNÓSTICO PEDAGÓGICO CON MIGRACIÓN AUTOMÁTICA)
+# 2. ESTADO DE SESIÓN
+# ==============================================================================
+DEFAULTS = {
+    "app_mode": "🎯 Guided Missions",
+    "cefr_level": "A1",
+    "phase": "onboarding",  # onboarding, comprehension, review, personal_production
+    "current_story": "",
+    "questions_list": [],
+    "current_q_idx": 0,
+    "correct_answers_count": 0,
+    "attempts": 0,
+    "personal_turn": 0,
+    "celebrated": False,
+    "xp": 0,
+    "streak": 0,
+    "chat_messages": [],
+    "pdf_chat_messages": [],
+    "pdf_text_content": "",
+    "pdf_name": "",
+    "last_processed_audio": None,
+    "tts_slow": False,
+    "active_user": None,
+    "ledger_error": None,
+}
+for _k, _v in DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = copy.deepcopy(_v)
+
+
+def reset_mission(full: bool = False):
+    s = st.session_state
+    s.phase = "onboarding"
+    s.current_story = ""
+    s.questions_list = []
+    s.current_q_idx = 0
+    s.correct_answers_count = 0
+    s.attempts = 0
+    s.personal_turn = 0
+    s.celebrated = False
+    s.chat_messages = []
+    s.last_processed_audio = None
+    if full:
+        s.cefr_level = "A1"
+        s.xp = 0
+        s.streak = 0
+        s.pdf_chat_messages = []
+        s.pdf_text_content = ""
+        s.pdf_name = ""
+
+
+# ==============================================================================
+# 3. PERSISTENCIA: SQLITE (local) + GOOGLE SHEETS (remoto)
 # ==============================================================================
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
@@ -34,602 +127,843 @@ def get_db_connection():
         pass
     return conn
 
+
 def init_db():
     conn = get_db_connection()
     with conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS diagnostics 
-                      (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                       student_name TEXT, 
-                       student_input TEXT, 
-                       ai_feedback TEXT, 
-                       grammar_topic TEXT, 
-                       pedagogical_analysis TEXT, 
-                       mastery_status TEXT, 
-                       used_pdf TEXT, 
-                       timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-        
-        # Migración segura: agregar 'pedagogical_analysis' si la tabla ya existía
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(diagnostics)")
-        cols = [col[1] for col in cursor.fetchall()]
-        if "pedagogical_analysis" not in cols:
-            try:
-                conn.execute("ALTER TABLE diagnostics ADD COLUMN pedagogical_analysis TEXT")
-            except Exception:
-                pass
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS diagnostics
+               (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_name TEXT, cefr_level TEXT, phase TEXT,
+                student_input TEXT, ai_feedback TEXT, score_status TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"""
+        )
     conn.close()
+
 
 init_db()
 
-def log_diagnostic_result(name, inp, feedback, topic, analysis, mastery_status, used_pdf):
+
+def sheets_write_enabled() -> bool:
+    """Escribir en Google Sheets requiere una cuenta de servicio en los secretos."""
+    try:
+        return str(st.secrets["connections"]["gsheets"].get("type", "")) == "service_account"
+    except Exception:
+        return False
+
+
+def append_to_ledger(row: dict):
+    """Agrega una fila a la pestaña diagnostics_ledger. Devuelve None si OK o un texto de error."""
+    if not SPREADSHEET_URL:
+        return "Falta la URL de la hoja de Google Sheets."
+    if not sheets_write_enabled():
+        return "Escritura en Sheets desactivada: falta la cuenta de servicio en los secretos."
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        try:
+            existing = conn.read(spreadsheet=SPREADSHEET_URL, worksheet=LEDGER_TAB, ttl=0)
+        except Exception:
+            existing = None
+        new_row = pd.DataFrame([row], columns=LEDGER_COLUMNS)
+        if existing is None or existing.dropna(how="all").empty:
+            data = new_row
+        else:
+            data = pd.concat([existing.dropna(how="all"), new_row], ignore_index=True)
+        try:
+            conn.update(spreadsheet=SPREADSHEET_URL, worksheet=LEDGER_TAB, data=data)
+        except Exception:
+            # Si la pestaña no existe, se crea
+            conn.create(spreadsheet=SPREADSHEET_URL, worksheet=LEDGER_TAB, data=data)
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def log_diagnostic(name, level, phase, s_input, feedback, score):
+    # 1) SQLite local (siempre)
     try:
         conn = get_db_connection()
         with conn:
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(diagnostics)")
-            cols = [col[1] for col in cursor.fetchall()]
-            
-            if "pedagogical_analysis" in cols:
-                cursor.execute("""INSERT INTO diagnostics 
-                              (student_name, student_input, ai_feedback, grammar_topic, pedagogical_analysis, mastery_status, used_pdf) 
-                              VALUES (?,?,?,?,?,?,?)""",
-                              (name, inp, feedback, topic, analysis, mastery_status, used_pdf))
-            else:
-                cursor.execute("""INSERT INTO diagnostics 
-                              (student_name, student_input, ai_feedback, grammar_topic, student_strengths, student_errors, mastery_status, used_pdf) 
-                              VALUES (?,?,?,?,?,?,?,?)""",
-                              (name, inp, feedback, topic, analysis, "None", mastery_status, used_pdf))
-            inserted_id = cursor.lastrowid
+            conn.execute(
+                """INSERT INTO diagnostics
+                   (student_name, cefr_level, phase, student_input, ai_feedback, score_status)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (name, level, phase, s_input, feedback, score),
+            )
         conn.close()
-        return inserted_id
     except Exception as e:
-        print(f"❌ Error al guardar log en SQLite: {e}")
+        print(f"Error SQLite: {e}")
+
+    # 2) Google Sheets (mejor esfuerzo; el error queda guardado para el panel del profesor)
+    st.session_state.ledger_error = append_to_ledger({
+        "student_name": name,
+        "cefr_level": level,
+        "phase": phase,
+        "student_input": s_input,
+        "ai_feedback": (feedback or "")[:250],
+        "score_status": score,
+        "timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+
+def load_ledger_df():
+    """Lee el registro desde Sheets; si no se puede, usa SQLite."""
+    if SPREADSHEET_URL:
+        try:
+            conn = st.connection("gsheets", type=GSheetsConnection)
+            df = conn.read(spreadsheet=SPREADSHEET_URL, worksheet=LEDGER_TAB, ttl=0)
+            if df is not None and not df.dropna(how="all").empty:
+                return df.dropna(how="all"), "Google Sheets"
+        except Exception:
+            pass
+    conn = get_db_connection()
+    df = pd.read_sql_query(
+        "SELECT student_name, cefr_level, phase, score_status, student_input, "
+        "ai_feedback, timestamp FROM diagnostics ORDER BY timestamp DESC",
+        conn,
+    )
+    conn.close()
+    return df, "SQLite local"
+
+
+# ==============================================================================
+# 4. ROSTER DESDE GOOGLE SHEETS (columnas: student_name | student_pin)
+# ==============================================================================
+def _normalize_roster(df: pd.DataFrame) -> dict:
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    name_c = next((c for c in df.columns if any(k in c for k in ["name", "nombre", "student"])), None)
+    pin_c = next((c for c in df.columns if c != name_c and any(k in c for k in ["pin", "pass", "clave", "code"])), None)
+    if name_c is None or pin_c is None:
+        raise ValueError(
+            f"No encontré las columnas de nombre y PIN (esperadas: 'student_name' y 'student_pin'). "
+            f"Columnas leídas: {list(df.columns)}"
+        )
+    df = df.dropna(subset=[name_c, pin_c])
+    names = df[name_c].astype(str).str.strip()
+    # Un PIN numérico puede llegar como "6421.0": se normaliza
+    pins = df[pin_c].astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
+    roster = {n: p for n, p in zip(names, pins) if n and n.lower() != "nan" and p and p.lower() != "nan"}
+    if not roster:
+        raise ValueError("La hoja se leyó, pero no contiene estudiantes.")
+    return roster
+
+
+def _public_csv_url(sheet_url: str, tab=None) -> str:
+    m = re.search(r"/d/([a-zA-Z0-9_-]+)", sheet_url)
+    if not m:
+        raise ValueError("No pude extraer el ID de la hoja desde la URL.")
+    url = f"https://docs.google.com/spreadsheets/d/{m.group(1)}/gviz/tq?tqx=out:csv"
+    if tab:
+        url += f"&sheet={urllib.parse.quote(tab)}"
+    return url  # sin 'sheet' devuelve la primera pestaña
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_roster(sheet_url: str):
+    """Devuelve (roster, fuente). Si falla todo, lanza excepción (así el error no se guarda en caché)."""
+    if not sheet_url:
+        raise ValueError("Falta la URL de la hoja de Google Sheets (secret 'spreadsheet').")
+    errors = []
+
+    # Intento 1: conexión oficial. Primero la pestaña 'roster'; si no existe, la primera pestaña.
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        last = None
+        for ws in (ROSTER_TAB, None):
+            try:
+                if ws:
+                    df = conn.read(spreadsheet=sheet_url, worksheet=ws, ttl=0)
+                else:
+                    df = conn.read(spreadsheet=sheet_url, ttl=0)
+                return _normalize_roster(df), "Google Sheets (conexión)"
+            except Exception as e:
+                last = e
+        raise last
+    except Exception as e:
+        errors.append(f"conexión: {e}")
+
+    # Intento 2: CSV público (requiere "Cualquier persona con el enlace" como lector)
+    for tab in (ROSTER_TAB, None):
+        try:
+            df = pd.read_csv(_public_csv_url(sheet_url, tab), dtype=str)
+            return _normalize_roster(df), "Google Sheets (CSV público)"
+        except Exception as e:
+            errors.append(f"CSV público ({tab or 'primera pestaña'}): {e}")
+
+    raise RuntimeError(" | ".join(errors))
+
+
+# ==============================================================================
+# 5. SÍNTESIS DE AUDIO (gTTS)
+# ==============================================================================
+def clean_for_tts(text: str) -> str:
+    text = re.sub(r"👉?\s*Model\s*[A-B]:?", "", text, flags=re.IGNORECASE)
+    # Quita emojis y símbolos; conserva letras, números y puntuación básica
+    text = re.sub(r"[^\w\s?!.,;:'’]", " ", text)
+    text = text.replace("_", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+@st.cache_data(show_spinner=False)
+def generate_audio_bytes(text, slow=False):
+    cleaned = clean_for_tts(text)
+    if not cleaned:
+        return None
+    try:
+        tts = gTTS(text=cleaned, lang="en", tld="com", slow=slow)
+        fp = BytesIO()
+        tts.write_to_fp(fp)
+        fp.seek(0)
+        return fp.read()
+    except Exception:
         return None
 
-def get_student_unmastered_weaknesses(name, limit=3):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(diagnostics)")
-        cols = [col[1] for col in cursor.fetchall()]
-        analysis_col = "pedagogical_analysis" if "pedagogical_analysis" in cols else "student_errors"
-
-        query = f"""
-            SELECT grammar_topic, {analysis_col} 
-            FROM diagnostics 
-            WHERE student_name = ? AND grammar_topic NOT IN ('Analyzing...', 'General Conversation') AND mastery_status != 'mastered'
-            ORDER BY id DESC LIMIT ?
-        """
-        df = pd.read_sql_query(query, conn, params=(name, limit))
-        conn.close()
-        if df.empty:
-            return "Beginner A1-A2 English learner. Focus on natural communication and clear sentence models."
-        
-        weakness_lines = []
-        for _, row in df.iterrows():
-            weakness_lines.append(f"- Focus Target: {row['grammar_topic']} | Note: {row[analysis_col]}")
-        return "\n".join(weakness_lines)
-    except Exception:
-        return "Learner profile currently initializing."
 
 # ==============================================================================
-# 3. GESTIÓN DE ROSTER Y LECTURA SEGURA DE GOOGLE SHEETS
-# ==============================================================================
-def get_authorized_students() -> dict:
-    try:
-        gsheet_conn = st.connection("gsheets", type=GSheetsConnection)
-        df = gsheet_conn.read(ttl=0)
-    except Exception:
-        df = None
-
-    if df is None or df.empty:
-        try:
-            raw_url = None
-            try:
-                raw_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
-            except Exception:
-                raw_url = None
-                
-            if raw_url and "/d/" in raw_url:
-                sheet_id = raw_url.split("/d/")[1].split("/")[0]
-                csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-                df = pd.read_csv(csv_url)
-            else:
-                return {"Edgar": "peru2026"}
-        except Exception:
-            return {"Edgar": "peru2026"}
-
-    try:
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        name_col = next((c for c in df.columns if any(k in c for k in ["name", "nombre", "student"])), df.columns[0])
-        pin_col = next((c for c in df.columns if any(k in c for k in ["pin", "pass", "clave", "code"])), df.columns[1])
-
-        df = df.dropna(subset=[name_col, pin_col])
-        df[name_col] = df[name_col].astype(str).str.strip()
-        df[pin_col] = df[pin_col].astype(str).str.strip()
-        return dict(zip(df[name_col], df[pin_col]))
-    except Exception:
-        return {"Edgar": "peru2026"}
-
-# ==============================================================================
-# 4. MOTOR DE AUDIO 100% INGLÉS (VOZ NATIVA EN-US, CLARA Y PAUSADA)
-# ==============================================================================
-def clean_for_speech(text):
-    clean = re.sub(r'[\_\-\(\)\[\]\{\}\*\#\«\»\<\>\/\\]', ' ', text)
-    clean = clean.replace('❌', '').replace('✅', '').replace('🎯', '').replace('💡', '').replace('🔍', '').replace('💬', '').replace('📖', '').replace('👉', '')
-    clean = re.sub(r'^\s*\d+\.\s*', '', clean, flags=re.MULTILINE)
-    clean = re.sub(r'(?:https?|ftp)://\S+', '', clean)
-    return re.sub(r'\s+', ' ', clean).strip()
-
-def render_communicative_audio(full_response_text, auto_play=True, key_suffix="", button_label="🔊 Listen to Tutor"):
-    paragraphs = [p.strip() for p in full_response_text.split("\n") if p.strip()]
-    cleaned_chunks = [clean_for_speech(p) for p in paragraphs if clean_for_speech(p)]
-    payload = json.dumps(cleaned_chunks)
-    auto_flag = "true" if auto_play else "false"
-
-    html_code = f"""
-    <div style="margin-top: 2px; margin-bottom: 2px;">
-        <button id="btn_{key_suffix}" style="
-            background-color: #0f172a;
-            color: #38bdf8;
-            border: 1px solid #0284c7;
-            border-radius: 6px;
-            padding: 8px 14px;
-            font-size: 14px;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            font-weight: 500;
-            width: 100%;
-            justify-content: center;
-        ">
-            {button_label}
-        </button>
-    </div>
-    <script>
-    (function() {{
-        var chunks = {payload};
-        var shouldAutoPlay = {auto_flag};
-        var btn = document.getElementById("btn_{key_suffix}");
-
-        function playFullSequence() {{
-            var synth = (window.top && window.top.speechSynthesis) || window.speechSynthesis;
-            if (!synth) return;
-            synth.cancel();
-
-            var voices = synth.getVoices();
-            var enVoice = voices.find(function(v) {{ 
-                return v.lang && (v.lang === "en-US" || v.lang === "en_US" || v.lang.startsWith("en")); 
-            }}) || voices[0];
-
-            if (!chunks || chunks.length === 0) return;
-
-            var utterances = [];
-            for (var i = 0; i < chunks.length; i++) {{
-                var text = chunks[i];
-                var utt = new SpeechSynthesisUtterance(text);
-                utt.voice = enVoice;
-                utt.lang = "en-US";
-                utt.rate = 0.88;
-                utterances.push(utt);
-            }}
-
-            for (var j = 0; j < utterances.length - 1; j++) {{
-                (function(index) {{
-                    utterances[index].onend = function() {{
-                        synth.speak(utterances[index + 1]);
-                    }};
-                }})(j);
-            }}
-
-            synth.speak(utterances[0]);
-        }}
-
-        if (btn) {{
-            btn.onclick = function() {{ playFullSequence(); }};
-        }}
-
-        if (shouldAutoPlay) {{
-            var synth = (window.top && window.top.speechSynthesis) || window.speechSynthesis;
-            if (synth && synth.getVoices().length > 0) {{
-                playFullSequence();
-            }} else if (synth) {{
-                synth.onvoiceschanged = function() {{
-                    playFullSequence();
-                    synth.onvoiceschanged = null;
-                }};
-            }}
-        }}
-    }})();
-    </script>
-    """
-    components.html(html_code, height=50)
-
-# ==============================================================================
-# 5. CONTROLADOR RESILIENTE DE LLAMADAS GEMINI
-# ==============================================================================
-def stream_with_retry(client_obj, model_name, contents_list, cfg, retries=3, delay=2.0):
-    for attempt in range(retries):
-        try:
-            return client_obj.models.generate_content_stream(
-                model=model_name,
-                contents=contents_list,
-                config=cfg
-            )
-        except Exception as e:
-            err_msg = str(e)
-            if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < retries - 1:
-                time.sleep(delay * (attempt + 1))
-                continue
-            raise e
-
-def generate_with_retry(client_obj, model_name, contents_val, cfg, retries=3, delay=2.0):
-    for attempt in range(retries):
-        try:
-            return client_obj.models.generate_content(
-                model=model_name,
-                contents=contents_val,
-                config=cfg
-            )
-        except Exception as e:
-            err_msg = str(e)
-            if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < retries - 1:
-                time.sleep(delay * (attempt + 1))
-                continue
-            raise e
-
-# ==============================================================================
-# 6. BARRA LATERAL (AUTENTICACIÓN, GESTIÓN & ANALÍTICA DOCENTE)
+# 6. BARRA LATERAL (AUTENTICACIÓN, MODO DE USO & PANEL DEL PROFESOR)
 # ==============================================================================
 with st.sidebar:
-    st.title("🗣️ Edgarvich Tutor de Ingles107")
-    
-    gemini_api_key = None
+    st.title("🧠 Edgarvich SLA Engine")
+
+    api_key = _secret("GEMINI_API_KEY")
+    if not api_key:
+        api_key = st.text_input("🔑 Gemini API Key:", type="password")
+
+    if not SPREADSHEET_URL:
+        SPREADSHEET_URL = st.text_input(
+            "📄 URL de la hoja de Google Sheets:",
+            help="Mejor defínela en Secrets: [connections.gsheets] spreadsheet = \"...\"",
+        ).strip()
+
+    st.divider()
     try:
-        if "GEMINI_API_KEY" in st.secrets:
-            gemini_api_key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        gemini_api_key = None
+        roster, roster_source = load_roster(SPREADSHEET_URL)
+        roster_error = None
+    except Exception as e:
+        roster, roster_source, roster_error = {}, None, str(e)
 
-    if not gemini_api_key:
-        gemini_api_key = os.environ.get("GEMINI_API_KEY")
-
-    if not gemini_api_key:
-        api_key_input = st.text_input("🔑 Gemini API Key:", type="password")
-        gemini_api_key = api_key_input
-
-    st.divider()
-    st.subheader("🔐 Student Login (Google Sheets)")
-    students_dict = get_authorized_students()
-    roster_names = ["-- Select your name --"] + sorted(list(students_dict.keys()))
-    
-    selected_student = st.selectbox("Select Your Name / Selecciona tu nombre:", roster_names)
-    entered_pin = st.text_input("PIN / Code:", type="password")
-    
-    authenticated = False
-    if selected_student != "-- Select your name --" and entered_pin:
-        if str(students_dict.get(selected_student, "")).strip() == entered_pin.strip():
-            authenticated = True
-            st.success(f"Welcome, {selected_student}!")
-        else:
-            st.error("Incorrect PIN / PIN incorrecto.")
-
-    st.divider()
-    st.subheader("📚 Supplementary Context (Optional)")
-    uploaded_file = st.file_uploader("Upload Vocabulary / Worksheet (PDF, TXT, MD)", type=["pdf", "txt", "md"])
-    pdf_bytes = None
-    text_content = ""
-    if uploaded_file:
-        if uploaded_file.name.lower().endswith(".pdf"):
-            pdf_bytes = uploaded_file.getvalue()
-        else:
-            text_content = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-        st.sidebar.success(f"✅ Material loaded: {uploaded_file.name}")
-
-    st.divider()
-    if st.button("🔄 Reset Conversation / Reiniciar"):
-        st.session_state.messages = []
-        st.session_state.last_audio_bytes = None
+    if roster_error:
+        st.error(
+            "❌ No pude leer la lista de estudiantes en Google Sheets.\n\n"
+            f"Detalle: {roster_error}"
+        )
+    if st.button("🔄 Reload student list"):
+        load_roster.clear()
         st.rerun()
 
+    names = ["-- Select your name --"] + sorted(roster.keys())
+    student_name = st.selectbox("Select Your Name:", names)
+    entered_pin = st.text_input("PIN:", type="password")
+
+    authenticated = False
+    if student_name != "-- Select your name --" and entered_pin:
+        expected = str(roster.get(student_name, "")).strip()
+        if expected and hmac.compare_digest(expected, entered_pin.strip()):
+            authenticated = True
+            st.success(f"Verified: {student_name}")
+        else:
+            st.error("PIN incorrecto.")
+
     st.divider()
-    instructor_key = st.text_input("Instructor Access:", type="password")
-    if instructor_key == "peru2026":
-        st.subheader("👨‍🏫 Instructor Control Panel")
-        with st.expander("📊 Student Oral Progress & Diagnostics Ledger", expanded=True):
-            if st.button("🔄 Refresh Analytics Table"):
-                st.rerun()
-
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(diagnostics)")
-            col_names = [col[1] for col in cursor.fetchall()]
-
-            # Seleccionar las columnas disponibles en la base de datos local
-            if "pedagogical_analysis" in col_names:
-                query_cols = "id, student_name, grammar_topic, pedagogical_analysis, mastery_status, student_input, ai_feedback, timestamp"
-            else:
-                query_cols = "id, student_name, grammar_topic, student_strengths AS pedagogical_analysis, mastery_status, student_input, ai_feedback, timestamp"
-
-            df = pd.read_sql_query(f"SELECT {query_cols} FROM diagnostics ORDER BY timestamp DESC", conn)
-            conn.close()
-
-            all_students = ["All"] + sorted([s for s in df["student_name"].dropna().unique() if s])
-            student_filter = st.selectbox("Filter by student:", all_students)
-            if student_filter != "All":
-                df_display = df[df["student_name"] == student_filter]
-            else:
-                df_display = df
-
-            col_m1, col_m2 = st.columns(2)
-            with col_m1:
-                st.metric("Total Exchanges", len(df_display))
-            with col_m2:
-                top_topic = df_display["grammar_topic"].mode()[0] if not df_display.empty else "N/A"
-                st.metric("Main Focus Topic", top_topic)
-
-            cols_config = {
-                "grammar_topic": st.column_config.TextColumn("Target Topic", width="medium"),
-                "pedagogical_analysis": st.column_config.TextColumn("Pedagogical Analysis", width="large"),
-                "mastery_status": st.column_config.TextColumn("Status", width="small"),
-                "student_input": st.column_config.TextColumn("Student Utterance / Question", width="medium"),
-                "ai_feedback": st.column_config.TextColumn("Tutor Output", width="large"),
-            }
-
-            st.dataframe(
-                df_display,
-                column_config=cols_config,
-                hide_index=True,
-                use_container_width=True
-            )
-            
-            st.download_button(
-                "📥 Download Research Analytics CSV", 
-                df.to_csv(index=False), 
-                "engl107_student_oral_diagnostics.csv", 
-                mime="text/csv"
-            )
-
-# ==============================================================================
-# 7. SESIÓN PRINCIPAL & ONBOARDING (A1 BEGINNERS)
-# ==============================================================================
-st.title("🗣️ Edgarvich Tutor de Ingles107")
-
-if not gemini_api_key:
-    st.warning("👈 Please enter or configure your GEMINI_API_KEY in the sidebar to begin.")
-    st.stop()
-
-if not authenticated:
-    st.warning("👈 Please select your name and enter your PIN in the sidebar to access your session.")
-    st.stop()
-
-@st.cache_resource
-def get_gemini_client(key):
-    return genai.Client(api_key=key)
-
-client = get_gemini_client(gemini_api_key)
-student_first_name = selected_student.split()[0]
-
-INITIAL_GREETING_A1 = (
-    f"Hello {student_first_name}! Welcome to your English practice! 👋\n\n"
-    "We will practice simple English step by step. Don't worry about mistakes!\n"
-    "**You can speak using the microphone below or type in the chat.** "
-    "*(Puedes hablar o preguntar en español cuando lo necesites, o hacer preguntas sobre cualquier tema gramatical).*\n\n"
-    "**What do you want to talk about today?**\n\n"
-    "1. **Introduce myself:** Name, city, and age.\n"
-    "2. **My favorite things:** Food and hobbies.\n"
-    "3. **My plans:** What I will do tomorrow.\n\n"
-    "👉 **Choose 1, 2, or 3 (or ask me any question) to begin!**"
-)
-
-if 'messages' not in st.session_state or st.session_state.get("active_user") != selected_student or not st.session_state.get("messages"):
-    st.session_state.active_user = selected_student
-    st.session_state.messages = [{
-        "role": "assistant",
-        "content": INITIAL_GREETING_A1,
-        "auto_play": True
-    }]
-    st.session_state.last_audio_bytes = None
-
-last_assistant_idx = -1
-for idx in range(len(st.session_state.messages) - 1, -1, -1):
-    if st.session_state.messages[idx]["role"] == "assistant":
-        last_assistant_idx = idx
-        break
-
-recorded_audio = None
-listen_placeholder = None
-
-for idx, m in enumerate(st.session_state.messages):
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-        if m.get("audio_data"):
-            st.audio(m["audio_data"], format="audio/wav")
-
-        # ==============================================================================
-        # 8. POSICIÓN: AUDIO Y MICRÓFONO JUSTO DESPUÉS DE LA ÚLTIMA RESPUESTA DEL TUTOR
-        # ==============================================================================
-        if idx == last_assistant_idx and m["role"] == "assistant":
-            st.markdown("---")
-            col_listen, col_mic = st.columns([1, 1])
-
-            with col_listen:
-                st.markdown("**🔊 Reescuchar / Listen:**")
-                listen_placeholder = st.empty()
-                with listen_placeholder:
-                    render_communicative_audio(
-                        m["content"], 
-                        auto_play=m.get("auto_play", False), 
-                        key_suffix=f"last_turn_{idx}",
-                        button_label="▶️ Replay Tutor Audio"
-                    )
-                m["auto_play"] = False
-
-            with col_mic:
-                st.markdown("**🎙️ Tu respuesta / Your Answer:**")
-                recorded_audio = st.audio_input("Record voice / Grabar respuesta:", key=f"audio_input_{idx}")
-
-text_input = st.chat_input("Type in English (or ask in Spanish if you need help)...")
-
-incoming_text = None
-incoming_audio_bytes = None
-
-if recorded_audio is not None:
-    audio_bytes = recorded_audio.getvalue()
-    if audio_bytes != st.session_state.get("last_audio_bytes"):
-        st.session_state.last_audio_bytes = audio_bytes
-        incoming_audio_bytes = audio_bytes
-        incoming_text = "🎙️ [Spoken Voice Message]"
-
-if text_input:
-    incoming_text = text_input
-
-# ==============================================================================
-# 9. MOTOR PEDAGÓGICO: COMUNICATIVO & ADAPTATIVO A PREGUNTAS Y TEMAS
-# ==============================================================================
-if incoming_text:
-    user_entry = {"role": "user", "content": incoming_text}
-    if incoming_audio_bytes:
-        user_entry["audio_data"] = incoming_audio_bytes
-    st.session_state.messages.append(user_entry)
-
-    with st.chat_message("user"):
-        st.markdown(incoming_text)
-        if incoming_audio_bytes:
-            st.audio(incoming_audio_bytes, format="audio/wav")
-
-    learner_weaknesses = get_student_unmastered_weaknesses(selected_student)
-
-    system_instruction = (
-        f"You are Edgarvich, a warm, encouraging English conversation coach helping {selected_student} ('{student_first_name}').\n"
-        f"Learner profile context / targets:\n{learner_weaknesses}\n\n"
-        "PEDAGOGICAL & INTERACTION RULES:\n"
-        "1. TOPIC & QUESTION AWARENESS (IMMEDIATE RECOGNITION):\n"
-        "   - If the student asks about a specific grammar topic or tense (e.g., Future with 'will' or 'going to', Past tenses, Conditionals, Prepositions):\n"
-        "     * IMMEDIATELY address their specific topic and answer clearly.\n"
-        "     * Give 1-2 clear, simple examples.\n"
-        "     * Ask an engaging question inviting them to practice that topic.\n"
-        "   - If the student selects '1', '2', or '3':\n"
-        "     * DO NOT repeat the greetings or ask what they want to practice.\n"
-        "     * Launch the chosen topic directly (1: Intro, 2: Favorites, 3: Plans/Future tomorrow).\n\n"
-        "2. COMMUNICATIVE FEEDBACK (FOCUS ON FORM):\n"
-        "   - When the student converses and makes an error or awkward phrasing:\n"
-        "     * Do NOT give lengthy grammar lectures.\n"
-        "     * Provide the natural version directly in bold on its own line:\n"
-        "       👉 **Natural way to say it:** [Polished natural sentence]\n"
-        "     * Acknowledge meaning warmly and keep the dialogue flowing.\n\n"
-        "3. COMPLETE SENTENCE MODELS (NEVER TRUNCATE):\n"
-        "   - Whenever helpful, provide finished sentence models they can say aloud:\n"
-        "     You can say:\n"
-        "     • \"[Complete Model 1]\"\n"
-        "     • \"[Complete Model 2]\"\n\n"
-        "4. NATURAL SPANISH-TO-ENGLISH BRIDGE:\n"
-        "   - If the student uses Spanish, translate key parts and bridge into English encouragingly.\n\n"
-        "5. FAST & NATURAL AUDIO READY:\n"
-        "   - Keep responses within 3 to 5 sentences total to maintain high pace and prevent cuts.\n"
-        "   - Avoid inverted Spanish punctuation ('¡', '¿') so en-US TTS reads smoothly."
+    st.session_state.app_mode = st.radio(
+        "Navigation Mode:",
+        ["🎯 Guided Missions", "📂 PDF Reading Lab"],
+        index=0 if st.session_state.app_mode == "🎯 Guided Missions" else 1,
     )
 
-    with st.chat_message("assistant"):
-        try:
-            contents = []
-            for msg in st.session_state.messages[-10:]:
-                content_text = msg.get("content", "")
-                if content_text and not content_text.startswith("🚨"):
-                    role = "user" if msg["role"] == "user" else "model"
-                    parts = []
-                    if msg.get("audio_data"):
-                        parts.append(types.Part.from_bytes(data=msg["audio_data"], mime_type="audio/wav"))
-                        parts.append(types.Part.from_text(text="[Listen to student audio. Answer questions directly, model natural English, and ask a follow-up question.]"))
-                    else:
-                        parts.append(types.Part.from_text(text=content_text))
-                    contents.append(types.Content(role=role, parts=parts))
+    if authenticated:
+        c1, c2 = st.columns(2)
+        c1.metric("⭐ XP", st.session_state.xp)
+        c2.metric("🔥 Streak", st.session_state.streak)
 
-            if pdf_bytes:
-                contents[-1].parts.insert(0, types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"))
-            elif text_content:
-                contents[-1].parts.insert(0, types.Part.from_text(text=f"[MATERIAL CONTEXT]:\n{text_content[:8000]}\n"))
-
-            fast_config = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                max_output_tokens=650,
-            )
-
-            def stream_response():
-                response = stream_with_retry(
-                    client_obj=client,
-                    model_name='gemini-3.8-flash',
-                    contents_list=contents,
-                    cfg=fast_config,
-                    retries=3,
-                    delay=2.0
-                )
-                for chunk in response:
-                    if chunk.text:
-                        yield chunk.text.replace("<", "«").replace(">", "»")
-
-            student_response = st.write_stream(stream_response)
-
-            # ==================================================================
-            # ANÁLISIS PEDAGÓGICO DIRECTO (SIN DEPENDENCIAS RÍGIDAS DE PYDANTIC)
-            # ==================================================================
-            grammar_topic = "General Conversation"
-            pedagogical_analysis = "Communicative interaction"
-            mastery_status = "needs_practice"
-
-            try:
-                analysis_prompt = (
-                    "You are an Applied Linguistics expert analyzing an English learner interaction.\n"
-                    "Analyze the following student utterance and tutor response:\n\n"
-                    f"Student Utterance: \"{incoming_text}\"\n"
-                    f"Tutor Response: \"{student_response}\"\n\n"
-                    "Return a JSON object with EXACTLY these three keys:\n"
-                    "{\n"
-                    "  \"grammar_topic\": \"<Specific topic name. Examples: 'Future (Will / Going to)', 'Present Perfect', 'Past Habitual (Used to)', 'Simple Past', 'Daily Routines', 'Questions with Do/Did'>\",\n"
-                    "  \"pedagogical_analysis\": \"<Concise description of the student's attempt, question asked, or specific slip corrected>\",\n"
-                    "  \"mastery_status\": \"<needs_practice, emerging, or mastered>\"\n"
-                    "}\n"
-                    "Do NOT output vague generalities. Detect the real topic of the question or sentence."
-                )
-
-                analysis_res = generate_with_retry(
-                    client_obj=client,
-                    model_name='gemini-3.8-flash',
-                    contents_val=analysis_prompt,
-                    cfg=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        max_output_tokens=300
-                    ),
-                    retries=2,
-                    delay=1.5
-                )
-
-                raw_text = str(analysis_res.text).strip()
-                match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-                if match:
-                    parsed_json = json.loads(match.group(0))
-                    grammar_topic = parsed_json.get("grammar_topic", grammar_topic)
-                    pedagogical_analysis = parsed_json.get("pedagogical_analysis", pedagogical_analysis)
-                    mastery_status = parsed_json.get("mastery_status", mastery_status)
-            except Exception as ex:
-                print(f"❌ Error en extracción JSON de diagnóstico: {ex}")
-
-            # Guardado directo en SQLite
-            log_diagnostic_result(
-                selected_student, incoming_text, student_response, 
-                grammar_topic, pedagogical_analysis, mastery_status,
-                "YES" if uploaded_file else "NO"
-            )
-
-            # Actualizar estado y refrescar
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": student_response,
-                "auto_play": False
-            })
-
+    if st.session_state.app_mode == "🎯 Guided Missions":
+        st.markdown(f"**Current CEFR Stage:** `{st.session_state.cefr_level}`")
+        st.markdown(f"**Active Phase:** `{st.session_state.phase.replace('_', ' ').title()}`")
+        if st.button("🔄 Reset Current Mission"):
+            reset_mission()
             st.rerun()
 
+    st.session_state.tts_slow = st.toggle("🐢 Slow Audio Speed", value=st.session_state.tts_slow)
+
+    # ---------------- Panel del profesor ----------------
+    st.divider()
+    instructor_input = st.text_input("Instructor Access:", type="password")
+    if not INSTRUCTOR_KEY:
+        st.caption("ℹ️ Define INSTRUCTOR_KEY en los Secrets para activar el panel del profesor.")
+    elif instructor_input and hmac.compare_digest(instructor_input, str(INSTRUCTOR_KEY)):
+        st.subheader("👨‍🏫 Instructor Control Panel")
+
+        with st.expander("🔌 Google Sheets connection status", expanded=True):
+            st.write(f"**Hoja (URL):** {SPREADSHEET_URL or '❌ no configurada'}")
+            st.write(f"**Lectura del roster:** {roster_source or '❌ fallida'} ({len(roster)} estudiantes)")
+            st.write(
+                "**Escritura en el registro:** "
+                + ("✅ cuenta de servicio configurada" if sheets_write_enabled() else "⚠️ desactivada (solo SQLite local)")
+            )
+            if st.session_state.ledger_error:
+                st.warning(f"Último error al escribir en Sheets: {st.session_state.ledger_error}")
+            if st.button("🧪 Write a test row to the ledger"):
+                err = append_to_ledger({
+                    "student_name": "TEST", "cefr_level": "A1", "phase": "test",
+                    "student_input": "test", "ai_feedback": "test", "score_status": "TEST",
+                    "timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                if err is None:
+                    st.success("✅ Fila escrita correctamente.")
+                else:
+                    st.error(err)
+
+        with st.expander("📊 Student Progress Ledger", expanded=True):
+            if st.button("🔄 Refresh Analytics"):
+                st.rerun()
+            df_diag, ledger_source = load_ledger_df()
+            st.caption(f"Fuente de datos: {ledger_source}")
+            if not df_diag.empty:
+                students = ["All"] + sorted(df_diag["student_name"].dropna().astype(str).unique())
+                chosen = st.selectbox("Filter by student:", students)
+                df_show = df_diag if chosen == "All" else df_diag[df_diag["student_name"] == chosen]
+                if "score_status" in df_show.columns:
+                    summary = df_show.groupby(["student_name", "score_status"]).size().unstack(fill_value=0)
+                    st.dataframe(summary, use_container_width=True)
+                st.dataframe(df_show, use_container_width=True)
+                st.download_button(
+                    "📥 Download Diagnostics CSV", df_show.to_csv(index=False),
+                    "engl107_student_diagnostics.csv", "text/csv",
+                )
+            else:
+                st.info("No diagnostic records logged yet.")
+
+# ==============================================================================
+# 7. PUERTA DE ACCESO + CLIENTE GEMINI
+# ==============================================================================
+if not api_key or not authenticated:
+    st.info("👈 Ingresa tu Gemini API Key e inicia sesión en la barra lateral para comenzar.")
+    st.stop()
+
+# Si cambia el estudiante, se reinicia el progreso (evita mezclar sesiones)
+if st.session_state.active_user != student_name:
+    reset_mission(full=True)
+    st.session_state.active_user = student_name
+
+
+@st.cache_resource
+def get_client(key):
+    return genai.Client(api_key=key)
+
+
+client = get_client(api_key)
+student_first_name = student_name.split()[0]
+
+
+def gen(contents, json_mode=False, temperature=0.2, retries=3):
+    cfg_kwargs = {"temperature": temperature}
+    if json_mode:
+        cfg_kwargs["response_mime_type"] = "application/json"
+    cfg = types.GenerateContentConfig(**cfg_kwargs)
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return client.models.generate_content(model=MODEL_NAME, contents=contents, config=cfg)
         except Exception as e:
-            st.error(f"🚨 Connection error: {e}")
+            last_err = e
+            if any(k in str(e) for k in ("503", "UNAVAILABLE", "429")) and attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+    raise last_err
+
+
+def parse_json(text: str):
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
+    data = json.loads(cleaned)
+    if isinstance(data, list) and data:
+        data = data[0]
+    return data
+
+
+FRIENDLY_ERROR = (
+    "⚠️ There was a technical problem contacting the tutor. Please try again in a few seconds. "
+    "(Hubo un problema técnico; intenta de nuevo.)"
+)
+
+
+# ==============================================================================
+# 8. COMPONENTES REUTILIZABLES
+# ==============================================================================
+def render_chat(messages):
+    last_idx = max([i for i, m in enumerate(messages) if m["role"] == "assistant"], default=-1)
+    for idx, msg in enumerate(messages):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if idx == last_idx and msg["role"] == "assistant" and msg.get("tts", True):
+                audio = generate_audio_bytes(msg["content"], slow=st.session_state.tts_slow)
+                if audio:
+                    st.audio(audio, format="audio/mp3", autoplay=msg.get("auto_play", False))
+            if idx == last_idx and msg["role"] == "assistant":
+                msg["auto_play"] = False
+
+
+def collect_input(mic_key: str, mic_label: str, placeholder: str):
+    recorded = st.audio_input(mic_label, key=mic_key)
+    typed = st.chat_input(placeholder)
+    text, audio = None, None
+    if recorded is not None:
+        raw = recorded.getvalue()
+        if raw != st.session_state.last_processed_audio:
+            st.session_state.last_processed_audio = raw
+            audio = raw
+            text = "🎙️ [Audio Submitted]"
+    if typed:
+        text, audio = typed, None
+    return text, audio
+
+
+def generate_story_and_questions(topic: str, level: str):
+    specs = {
+        "A1": "Word count: 100-120 words. Grammar focus: Present Simple & Daily Habits. Syntax: S-V-O simple structures.",
+        "A2": "Word count: 130-150 words. Grammar focus: Simple Past (regular/irregular) & Connectors (then, because, after).",
+        "B1": "Word count: 180-200 words. Grammar focus: Present Perfect vs Simple Past, Past Continuous, opinion adverbs.",
+        "B2": "Word count: 230-260 words. Grammar focus: Conditionals, Passive Voice, Relative clauses, and idiomatic expressions.",
+    }
+    prompt = f"""
+    You are an expert SLA curriculum designer.
+    Generate a short narrative and 5 comprehension questions for an adult L2 English learner.
+    Level: {level} ({specs.get(level, specs['A1'])})
+    Topic: {topic}
+
+    REQUIREMENTS:
+    1. STORY (Textual Enhancement):
+       - Apply deliberate textual enhancement by bolding target conjugated verbs and key vocabulary with **double asterisks**.
+       - Keep it contextual, mature, and meaningful.
+    2. 5 COMPREHENSION QUESTIONS:
+       - Progressive difficulty: Q1-Q2 (Direct recall), Q3-Q4 (Detail identification), Q5 (Short inference).
+       - context_hint: Provide the specific line from the text that points to the answer.
+       - expected_core: The key factual answer.
+
+    Return strictly a valid JSON object:
+    {{
+      "story": "The complete enhanced story with **bolded verbs**...",
+      "questions": [
+        {{"q_num": 1, "question": "Question text...", "expected_core": "answer core", "context_hint": "Quote or paragraph reference"}},
+        {{"q_num": 2, "question": "Question text...", "expected_core": "answer core", "context_hint": "Quote or paragraph reference"}},
+        {{"q_num": 3, "question": "Question text...", "expected_core": "answer core", "context_hint": "Quote or paragraph reference"}},
+        {{"q_num": 4, "question": "Question text...", "expected_core": "answer core", "context_hint": "Quote or paragraph reference"}},
+        {{"q_num": 5, "question": "Question text...", "expected_core": "answer core", "context_hint": "Quote or paragraph reference"}}
+      ]
+    }}
+    """
+    resp = gen([types.Part.from_text(text=prompt)], json_mode=True, temperature=0.2)
+    package = parse_json(resp.text)
+    if not package.get("story") or not package.get("questions"):
+        raise ValueError("The model response did not include a story or questions.")
+    return package
+
+
+def start_comprehension(first_question: str, total: int):
+    st.session_state.current_q_idx = 0
+    st.session_state.correct_answers_count = 0
+    st.session_state.attempts = 0
+    st.session_state.phase = "comprehension"
+    st.session_state.chat_messages = [{
+        "role": "assistant",
+        "content": f"**Question 1 of {total}:** {first_question}",
+        "auto_play": True,
+    }]
+
+
+def advance_question(prefix: str):
+    s = st.session_state
+    s.current_q_idx += 1
+    s.attempts = 0
+    total = len(s.questions_list)
+    if s.current_q_idx < total:
+        nxt = s.questions_list[s.current_q_idx]["question"]
+        msg = f"{prefix}\n\n---\n**Question {s.current_q_idx + 1} of {total}:** {nxt}"
+    elif s.correct_answers_count >= max(total - 1, 1):
+        s.phase = "personal_production"
+        s.personal_turn = 0
+        s.celebrated = False
+        msg = (
+            f"{prefix}\n\n🎉 **Comprehension check complete! You scored {s.correct_answers_count}/{total}.**\n\n"
+            "Connecting this story to your real life..."
+        )
+    else:
+        s.phase = "review"
+        msg = f"{prefix}\n\n📊 **Score: {s.correct_answers_count}/{total}.**"
+    s.chat_messages.append({"role": "assistant", "content": msg, "auto_play": True})
+
+
+# ==============================================================================
+# 9. MODO 1: MISIÓN GUIADA
+# ==============================================================================
+if st.session_state.app_mode == "🎯 Guided Missions":
+    level = st.session_state.cefr_level
+
+    # ---------------- Fase 0: onboarding ----------------
+    if st.session_state.phase == "onboarding":
+        welcome_msg = (
+            f"Hello {student_first_name}! Welcome back to your learning space. "
+            f"Today we will read a short story together at your {level} level. "
+            "First, you will listen and read. Then, we will work through 5 quick questions in our chat. "
+            "If you ever have a doubt about a word or grammar, just ask me directly in the chat! "
+            "Choose a story below to begin."
+        )
+        st.markdown(f"### 👋 Welcome, {student_first_name}!")
+        st.markdown(welcome_msg)
+
+        welcome_audio = generate_audio_bytes(welcome_msg, slow=st.session_state.tts_slow)
+        if welcome_audio:
+            st.audio(welcome_audio, format="audio/mp3")
+
+        st.markdown("---")
+        st.markdown("#### Choose your story for today:")
+
+        col1, col2 = st.columns(2)
+        chosen_topic = None
+        with col1:
+            if st.button("🍳 The Kitchen Mystery (Food, Routines & Actions)", use_container_width=True):
+                chosen_topic = "Cooking at home and morning food choices"
+            if st.button("✈️ The Unexpected Journey (Travel & Places)", use_container_width=True):
+                chosen_topic = "A business trip with flight delays"
+        with col2:
+            if st.button("💼 A Busy Day at Work (Projects & Deadlines)", use_container_width=True):
+                chosen_topic = "Managing tasks and unexpected phone calls"
+            if st.button("🌆 City Explorers (Weekend Adventures)", use_container_width=True):
+                chosen_topic = "Visiting a new neighborhood and finding a cafe"
+
+        if chosen_topic:
+            try:
+                with st.spinner("Preparing your enhanced reading and tasks..."):
+                    package = generate_story_and_questions(chosen_topic, level)
+                st.session_state.current_story = package["story"]
+                st.session_state.questions_list = package["questions"]
+                start_comprehension(package["questions"][0]["question"], len(package["questions"]))
+                st.rerun()
+            except Exception as e:
+                st.error(f"{FRIENDLY_ERROR}\n\nDetail: {e}")
+
+    # ---------------- Fase 1: comprensión ----------------
+    elif st.session_state.phase == "comprehension":
+        total_q = len(st.session_state.questions_list)
+        q_idx = st.session_state.current_q_idx
+
+        with st.expander("📖 Target Reading (Notice the bolded forms)", expanded=True):
+            st.markdown(st.session_state.current_story)
+            story_audio = generate_audio_bytes(st.session_state.current_story, slow=st.session_state.tts_slow)
+            if story_audio:
+                st.audio(story_audio, format="audio/mp3")
+
+        st.progress(min(q_idx / total_q, 1.0), text=f"Comprehension Check: Question {min(q_idx + 1, total_q)} of {total_q}")
+
+        render_chat(st.session_state.chat_messages)
+        st.markdown("---")
+        st.caption("💡 **Tip:** You can answer the question OR ask me any doubt about vocabulary or grammar in English or Spanish!")
+
+        incoming_text, incoming_audio = collect_input(
+            f"rec_mic_q_{q_idx}",
+            "🎙️ Speak your answer or question:",
+            "Type your answer or ask a question about the text...",
+        )
+
+        if incoming_text:
+            st.session_state.chat_messages.append({"role": "user", "content": incoming_text})
+            q = st.session_state.questions_list[q_idx]
+
+            eval_prompt = f"""
+            You are Edgarvich, an expert SLA communicative tutor.
+            Learner Level: {level}
+
+            CONTEXT STORY:
+            "{st.session_state.current_story}"
+
+            CURRENT ACTIVE TASK:
+            Question: "{q['question']}"
+            Expected Content: "{q['expected_core']}"
+            Context Hint: "{q['context_hint']}"
+
+            STUDENT INPUT: "{incoming_text}"
+            (If an audio clip is attached, it is the student's spoken input: listen to it and evaluate what was said.)
+
+            STEP 1: INTENT CLASSIFICATION:
+            - Is the student ASKING a question, requesting clarification, vocabulary meaning, translation, or expressing confusion? -> intent = "INQUIRY"
+            - Is the student TRYING TO ANSWER the comprehension question? -> intent = "ANSWER"
+
+            STEP 2: ACTIONS:
+            - IF intent == "INQUIRY":
+                * Answer their doubt warmly and thoroughly (in clear English with brief Spanish support if helpful).
+                * Do NOT count this as correct or incorrect.
+                * Gently bring them back to the active question at the end.
+            - IF intent == "ANSWER":
+                * is_correct = true if the MEANING is right, even with minor grammar or spelling slips.
+                * If correct: praise warmly and recast the full target sentence correctly.
+                * If incorrect: give a SCAFFOLDING HINT pointing to the text (DO NOT GIVE THE ANSWER), and give Model A & Model B starters.
+
+            Return strictly a valid JSON object:
+            {{
+              "intent": "INQUIRY" or "ANSWER",
+              "is_correct": true or false,
+              "feedback_text": "Your pedagogical response...",
+              "model_a": "Model A starter (if ANSWER and incorrect)...",
+              "model_b": "Model B starter (if ANSWER and incorrect)..."
+            }}
+            """
+            parts = [types.Part.from_text(text=eval_prompt)]
+            if incoming_audio:
+                parts.insert(0, types.Part.from_bytes(data=incoming_audio, mime_type="audio/wav"))
+
+            try:
+                with st.spinner("Edgarvich is thinking..."):
+                    parsed = parse_json(gen(parts, json_mode=True, temperature=0.1).text)
+            except Exception as e:
+                st.session_state.chat_messages.append(
+                    {"role": "assistant", "content": f"{FRIENDLY_ERROR}\n\n`{e}`", "tts": False}
+                )
+                st.rerun()
+
+            intent = parsed.get("intent", "ANSWER")
+            fb_text = parsed.get("feedback_text", "")
+            is_correct = bool(parsed.get("is_correct", False))
+            m_a, m_b = parsed.get("model_a", ""), parsed.get("model_b", "")
+
+            if intent == "INQUIRY":
+                st.session_state.chat_messages.append({
+                    "role": "assistant", "auto_play": True,
+                    "content": (
+                        f"💬 **Teacher Explanation:**\n{fb_text}\n\n"
+                        f"---\n👉 **Let's continue with Question {q_idx + 1}:** {q['question']}"
+                    ),
+                })
+                log_diagnostic(student_name, level, "comprehension_inquiry", incoming_text, fb_text, "CLARIFICATION")
+
+            elif is_correct:
+                points = 10 if st.session_state.attempts == 0 else 5
+                st.session_state.xp += points
+                st.session_state.streak += 1
+                st.session_state.correct_answers_count += 1
+                log_diagnostic(student_name, level, "comprehension", incoming_text, fb_text, "CORRECT")
+                advance_question(f"{fb_text}\n\n⭐ **+{points} XP**")
+
+            else:
+                st.session_state.attempts += 1
+                st.session_state.streak = 0
+                log_diagnostic(student_name, level, "comprehension", incoming_text, fb_text, "INCORRECT")
+                if st.session_state.attempts >= MAX_ATTEMPTS:
+                    reveal = (
+                        f"{fb_text}\n\n✅ **Answer:** {q['expected_core']}\n"
+                        f"📖 {q['context_hint']}\n\n_No worries — let's move on!_"
+                    )
+                    log_diagnostic(student_name, level, "comprehension", incoming_text, "answer revealed", "REVEALED")
+                    advance_question(reveal)
+                else:
+                    st.session_state.chat_messages.append({
+                        "role": "assistant", "auto_play": True,
+                        "content": (
+                            f"💡 **Hint:** {fb_text}\n\n👉 **{m_a}**\n👉 **{m_b}**\n\n"
+                            f"_Attempt {st.session_state.attempts} of {MAX_ATTEMPTS} — you can do it!_"
+                        ),
+                    })
+            st.rerun()
+
+    # ---------------- Fase 1b: repaso (puntaje bajo) ----------------
+    elif st.session_state.phase == "review":
+        with st.expander("📖 Target Reading", expanded=False):
+            st.markdown(st.session_state.current_story)
+        render_chat(st.session_state.chat_messages)
+        st.markdown("---")
+        st.info("Let's reinforce these structures. What would you like to do?")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("🔁 Repeat this story", use_container_width=True):
+                total = len(st.session_state.questions_list)
+                start_comprehension(st.session_state.questions_list[0]["question"], total)
+                st.rerun()
+        with col_b:
+            if st.button("📚 Choose a new story", use_container_width=True):
+                reset_mission()
+                st.rerun()
+
+    # ---------------- Fase 2: producción personal ----------------
+    elif st.session_state.phase == "personal_production":
+        with st.expander("📖 Story Reference", expanded=False):
+            st.markdown(st.session_state.current_story)
+
+        if st.session_state.personal_turn == 0:
+            try:
+                with st.spinner("Preparing your personalized mission question..."):
+                    personal_prompt = f"""
+                    Based on this story:
+                    "{st.session_state.current_story}"
+                    Welcome {student_first_name} to the personal production stage.
+                    Ask ONE personal communicative question connecting the story's theme directly to their own daily routine or habits.
+                    Level: {level}.
+                    Provide two model starters:
+                    👉 Model A: "..."
+                    👉 Model B: "..."
+                    """
+                    first_q = gen([types.Part.from_text(text=personal_prompt)], temperature=0.4)
+                st.session_state.chat_messages.append(
+                    {"role": "assistant", "content": first_q.text, "auto_play": True}
+                )
+                st.session_state.personal_turn = 1
+                st.rerun()
+            except Exception as e:
+                st.error(f"{FRIENDLY_ERROR}\n\nDetail: {e}")
+                st.stop()
+
+        turn = st.session_state.personal_turn
+        finished = turn > 3
+
+        st.markdown(f"### 💬 Personal Practice — Stage {level} (Turn {min(turn, 3)} of 3)")
+        render_chat(st.session_state.chat_messages)
+
+        if finished:
+            if not st.session_state.celebrated:
+                st.balloons()
+                st.session_state.celebrated = True
+            st.success(f"🏆 MISSION COMPLETED! You mastered Stage {level}!")
+            st.metric("⭐ Total XP", st.session_state.xp)
+            c_idx = LEVELS.index(level) if level in LEVELS else 0
+            if c_idx < len(LEVELS) - 1:
+                next_lvl = LEVELS[c_idx + 1]
+                if st.button(f"🚀 Advance to Level {next_lvl}"):
+                    st.session_state.cefr_level = next_lvl
+                    reset_mission()
+                    st.rerun()
+            else:
+                st.success("🌟 Congratulations! You have completed all tiers up to B2!")
+                if st.button("Start a new mission"):
+                    reset_mission()
+                    st.rerun()
+            st.stop()
+
+        st.markdown("---")
+        p_text, p_audio = collect_input(
+            f"rec_mic_p_{turn}",
+            "🎙️ Speak your response:",
+            "Type your response or ask a clarification question...",
+        )
+
+        if p_text:
+            st.session_state.chat_messages.append({"role": "user", "content": p_text})
+            last_q = next(
+                (m["content"] for m in reversed(st.session_state.chat_messages) if m["role"] == "assistant"), ""
+            )
+
+            p_prompt = f"""
+            You are Edgarvich, communicative ESL coach.
+            Learner: {student_first_name} | CEFR Level: {level}
+            Previous tutor message: "{last_q}"
+            Student response: "{p_text}"
+            (If an audio clip is attached, it is the student's spoken response: listen to it and evaluate it.)
+            The student is answering turn {turn} of 3.
+
+            Return strictly a JSON object: {{"intent": "INQUIRY" or "ANSWER", "message": "..."}}
+            - INQUIRY (the student asks for clarification or a language question): message = concise clarification
+              (English, with brief Spanish support if helpful), then repeat the invitation for the current turn.
+            - ANSWER (the student speaks about their experience): message =
+                * brief warm praise,
+                * a reactive recast with the corrected sentence if there is any grammatical/morphological slip,
+                * if turn < 3: ONE natural follow-up question plus "👉 Model A: ..." and "👉 Model B: ...";
+                * if turn == 3: warm congratulations on completing the cycle, and NO new question.
+            """
+            parts = [types.Part.from_text(text=p_prompt)]
+            if p_audio:
+                parts.insert(0, types.Part.from_bytes(data=p_audio, mime_type="audio/wav"))
+
+            try:
+                with st.spinner("Edgarvich is thinking..."):
+                    parsed = parse_json(gen(parts, json_mode=True, temperature=0.3).text)
+            except Exception as e:
+                st.session_state.chat_messages.append(
+                    {"role": "assistant", "content": f"{FRIENDLY_ERROR}\n\n`{e}`", "tts": False}
+                )
+                st.rerun()
+
+            intent = parsed.get("intent", "ANSWER")
+            message = parsed.get("message", "")
+
+            if intent == "INQUIRY":
+                st.session_state.chat_messages.append(
+                    {"role": "assistant", "content": message, "auto_play": True}
+                )
+                log_diagnostic(student_name, level, "personal_inquiry", p_text, message, "CLARIFICATION")
+            else:
+                st.session_state.xp += 5
+                st.session_state.chat_messages.append(
+                    {"role": "assistant", "content": f"{message}\n\n⭐ **+5 XP**", "auto_play": True}
+                )
+                log_diagnostic(student_name, level, "personal_production", p_text, message, "PRODUCED")
+                st.session_state.personal_turn += 1
+            st.rerun()
+
+# ==============================================================================
+# 10. MODO 2: LABORATORIO DE LECTURA DE PDFS
+# ==============================================================================
+else:
+    st.subheader("📂 Interactive Document & PDF Reading Lab")
+    st.caption("Upload any PDF, article, or class handout. Read the text, ask questions, explore vocabulary, or request a customized quiz!")
+
+    uploaded_file = st.file_uploader("Upload your PDF or Text File:", type=["pdf", "txt"])
+
+    if uploaded_file is not None and uploaded_file.name != st.session_state.pdf_name:
+        try:
+            if uploaded_file.name.lower().endswith(".pdf"):
+                reader = pypdf.PdfReader(BytesIO(uploaded_file.getvalue()))
+                pages = [(p.extract_text() or "") for p in reader.pages]
+                st.session_state.pdf_text_content = "\n".join(pages).strip()
+            else:
+                st.session_state.pdf_text_content = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+            st.session_state.pdf_name = uploaded_file.name
+            st.session_state.pdf_chat_messages = []
+        except Exception as e:
+            st.error(f"Could not read the file: {e}")
+
+    if st.session_state.pdf_text_content:
+        words = len(st.session_state.pdf_text_content.split())
+        st.success(f"✅ Loaded: {st.session_state.pdf_name} ({words} words)")
+
+        with st.expander("📄 Document Content Preview", expanded=False):
+            preview = st.session_state.pdf_text_content
+            st.markdown(preview[:3000] + ("..." if len(preview) > 3000 else ""))
+
+        for msg in st.session_state.pdf_chat_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        pdf_query = st.chat_input("Ask a question about this document, request vocabulary help, or ask: 'Quiz me'...")
+        if pdf_query:
+            st.session_state.pdf_chat_messages.append({"role": "user", "content": pdf_query})
+            history = "\n".join(
+                f"{m['role'].upper()}: {m['content'][:400]}" for m in st.session_state.pdf_chat_messages[-7:-1]
+            )
+            pdf_prompt = f"""
+            You are Edgarvich, an ESL reading specialist and tutor.
+            Learner: {student_first_name} | Target Level: {st.session_state.cefr_level}
+
+            DOCUMENT CONTENT:
+            \"\"\"{st.session_state.pdf_text_content[:8000]}\"\"\"
+
+            RECENT CONVERSATION:
+            {history}
+
+            STUDENT REQUEST: "{pdf_query}"
+
+            CAPABILITIES:
+            1. Vocabulary: define words simply, give example sentences, and mention the Spanish equivalent if helpful.
+            2. Summary: summarize in calibrated {st.session_state.cefr_level} English using bullet points.
+            3. 'Quiz me' / 'Ask me questions': generate 3 comprehension questions from the document with Model A and Model B starters.
+            4. Factual question: answer referencing the document directly.
+
+            Tone: Supportive, communicative, concise.
+            """
+            try:
+                with st.spinner("Thinking..."):
+                    reply = gen([types.Part.from_text(text=pdf_prompt)], temperature=0.3).text
+            except Exception as e:
+                reply = f"{FRIENDLY_ERROR}\n\n`{e}`"
+            st.session_state.pdf_chat_messages.append({"role": "assistant", "content": reply})
+            st.rerun()
+    else:
+        st.info("👆 Please upload a PDF or TXT file above to activate the Reading Lab.")

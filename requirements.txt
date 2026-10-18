@@ -1,6 +1,7 @@
 streamlit
+pandas
 st-gsheets-connection
 google-genai
-gTTS
+pydantic
 pypdf
-pandas
+gTTS

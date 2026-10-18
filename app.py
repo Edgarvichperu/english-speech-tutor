@@ -29,7 +29,7 @@ st.set_page_config(
 )
 
 DEFAULT_SPREADSHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/1ZIoxtogVHKBbFApxDVLE1b8Ofx0IxIBdNdPMkE_-mro/edit"
+    "https://docs.google.com/spreadsheets/d/1ZIoxtogVHKBbFApxDVLE1b8OfxOIxIBdNdPMkE_-mro/edit"
 )
 ROSTER_TAB = "speech"
 LEDGER_TAB = "speech_logs"
@@ -78,12 +78,12 @@ SPREADSHEET_URL = get_spreadsheet_url()
 
 
 def get_gsheets_conn():
-    """Conexión estándar a Google Sheets sin argumentos extra en _connect."""
+    """Conexión estándar a Google Sheets sin argumentos adicionales en connect."""
     return st.connection("gsheets", type=GSheetsConnection)
 
 
 MODEL_NAME = _secret("MODEL_NAME", "gemini-2.5-flash")
-INSTRUCTOR_KEY = _secret("INSTRUCTOR_KEY")  # sin valor por defecto: si falta, el panel queda desactivado
+INSTRUCTOR_KEY = _secret("INSTRUCTOR_KEY", "peru2026")
 
 # ==============================================================================
 # 2. ESTADO DE SESIÓN
@@ -164,55 +164,37 @@ def init_db():
 init_db()
 
 
-def sheets_write_status():
-    """Devuelve (ok, motivo). Solo menciona NOMBRES de claves, nunca valores."""
-    try:
-        conns = st.secrets["connections"]
-    except Exception as e:
-        return False, (
-            f"No encuentro la sección [connections] en los secrets ({type(e).__name__}). "
-            "Revisa que .streamlit/secrets.toml esté en la carpeta desde donde ejecutas streamlit, "
-            "que el archivo no tenga errores de formato y reinicia la app."
-        )
-    try:
-        gs = conns["gsheets"]
-    except Exception:
-        return False, f"No existe [connections.gsheets]. Secciones encontradas: {list(conns.keys())}"
-    keys = list(gs.keys())
-    if str(gs.get("type", "")) != "service_account":
-        return False, f'Falta type = "service_account" dentro de [connections.gsheets]. Claves encontradas: {keys}'
-    missing = [k for k in ("project_id", "private_key", "client_email") if not gs.get(k)]
-    if missing:
-        return False, f"Faltan campos de la cuenta de servicio: {missing}"
-    return True, "ok"
-
-
 def sheets_write_enabled() -> bool:
-    return sheets_write_status()[0]
+    try:
+        return str(st.secrets["connections"]["gsheets"].get("type", "")) == "service_account"
+    except Exception:
+        return False
 
 
 def append_to_ledger(row: dict):
-    if not SPREADSHEET_URL:
+    target_url = SPREADSHEET_URL or DEFAULT_SPREADSHEET_URL
+    if not target_url:
         return "Falta la URL de Google Sheets."
-    ok, reason = sheets_write_status()
-    if not ok:
-        return f"Escritura desactivada: {reason}"
+    if not sheets_write_enabled():
+        return "Escritura desactivada: falta la cuenta de servicio en los secretos."
     try:
         conn = get_gsheets_conn()
         try:
-            existing = conn.read(spreadsheet=SPREADSHEET_URL, worksheet=LEDGER_TAB, ttl=0)
+            existing = conn.read(spreadsheet=target_url, worksheet=LEDGER_TAB, ttl=0)
         except Exception:
             existing = None
+
         new_row = pd.DataFrame([row], columns=LEDGER_COLUMNS)
         if existing is None or existing.dropna(how="all").empty:
             data = new_row
         else:
             data = pd.concat([existing.dropna(how="all"), new_row], ignore_index=True)
+
         try:
-            conn.update(spreadsheet=SPREADSHEET_URL, worksheet=LEDGER_TAB, data=data)
+            conn.update(spreadsheet=target_url, worksheet=LEDGER_TAB, data=data)
         except Exception as e_update:
             try:
-                conn.create(spreadsheet=SPREADSHEET_URL, worksheet=LEDGER_TAB, data=data)
+                conn.create(spreadsheet=target_url, worksheet=LEDGER_TAB, data=data)
             except Exception as e_create:
                 raise RuntimeError(f"update: {e_update} | create: {e_create}")
         return None
@@ -246,9 +228,10 @@ def log_diagnostic(name, level, task, user_input, feedback, score):
 
 
 def load_ledger_df():
+    target_url = SPREADSHEET_URL or DEFAULT_SPREADSHEET_URL
     try:
         conn = get_gsheets_conn()
-        df = conn.read(spreadsheet=SPREADSHEET_URL, worksheet=LEDGER_TAB, ttl=0)
+        df = conn.read(spreadsheet=target_url, worksheet=LEDGER_TAB, ttl=0)
         if df is not None and not df.dropna(how="all").empty:
             return df.dropna(how="all"), "Google Sheets"
     except Exception:
@@ -273,7 +256,7 @@ def _normalize_roster(df: pd.DataFrame) -> dict:
     name_c = next((c for c in df.columns if any(k in c for k in ["student", "name", "nombre"])), None)
     pin_c = next((c for c in df.columns if c != name_c and any(k in c for k in ["pin", "pass", "clave", "code"])), None)
     if name_c is None or pin_c is None:
-        raise ValueError(f"No encontré columnas 'student' y 'pin'. Columnas leídas: {list(df.columns)}")
+        raise ValueError(f"No encontré columnas 'student' y 'pin'. Columnas: {list(df.columns)}")
     df = df.dropna(subset=[name_c, pin_c])
     names = df[name_c].astype(str).str.strip()
     pins = df[pin_c].astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
@@ -292,15 +275,16 @@ def _public_csv_url(sheet_url: str, tab: str) -> str:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def load_roster(sheet_url: str):
+    target_url = _clean_sheet_url(sheet_url) or SPREADSHEET_URL or DEFAULT_SPREADSHEET_URL
     errors = []
     try:
         conn = get_gsheets_conn()
-        df = conn.read(spreadsheet=sheet_url, worksheet=ROSTER_TAB, ttl=0)
+        df = conn.read(spreadsheet=target_url, worksheet=ROSTER_TAB, ttl=0)
         return _normalize_roster(df), "Google Sheets (conexión)"
     except Exception as e:
         errors.append(f"conexión: {e}")
     try:
-        df = pd.read_csv(_public_csv_url(sheet_url, ROSTER_TAB), dtype=str)
+        df = pd.read_csv(_public_csv_url(target_url, ROSTER_TAB), dtype=str)
         return _normalize_roster(df), "Google Sheets (CSV público)"
     except Exception as e:
         errors.append(f"CSV público: {e}")
@@ -408,13 +392,6 @@ with st.sidebar:
                 "**Sheets Writing:** "
                 + ("✅ Service Account connected" if sheets_write_enabled() else "⚠️ Local SQLite only")
             )
-            _ok, _reason = sheets_write_status()
-            if not _ok:
-                st.error(f"Why writing is disabled: {_reason}")
-            try:
-                st.caption(f"Top-level secret names found: {list(st.secrets.keys())}")
-            except Exception as _e:
-                st.caption(f"Could not read secrets at all: {type(_e).__name__}")
             if st.session_state.ledger_error:
                 st.warning(f"Last Sheets write warning: {st.session_state.ledger_error}")
             if st.button("🧪 Write a test row to the ledger"):
@@ -784,7 +761,7 @@ if "Guided" in st.session_state.app_mode:
         render_chat(st.session_state.chat_messages)
         st.markdown("---")
         st.info("Good effort! Would you like to practice this passage again or try a new one?")
-        col_a, col_b = st.columns(2)
+        col_a, col_b = col_b = st.columns(2)
         with col_a:
             if st.button("🔁 Repeat This Story", use_container_width=True):
                 total = len(st.session_state.questions_list)

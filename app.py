@@ -28,8 +28,8 @@ st.set_page_config(
     page_icon="🇬🇧",
 )
 
-# La URL de la hoja se define SOLO en los Secrets ([connections.gsheets] spreadsheet = "...").
-DEFAULT_SPREADSHEET_URL = ""
+# URL vinculada a speech_database
+DEFAULT_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1ZIoxtogVHKBbFApxDVLE1b8Ofx0IxIBdNdPMkE_-mro/edit?usp=sharing"
 ROSTER_TAB = "speech"
 LEDGER_TAB = "speech_logs"
 LEDGER_COLUMNS = [
@@ -73,7 +73,7 @@ def get_spreadsheet_url() -> str:
     return DEFAULT_SPREADSHEET_URL
 
 
-SPREADSHEET_URL = get_spreadsheet_url()
+SPREADSHEET_URL = get_spreadsheet_url() or DEFAULT_SPREADSHEET_URL
 
 
 def get_gsheets_conn():
@@ -179,7 +179,7 @@ def sheets_write_status():
     keys = list(gs.keys())
     if str(gs.get("type", "")) != "service_account":
         return False, f'Falta type = "service_account" dentro de [connections.gsheets]. Claves encontradas: {keys}'
-    if not str(gs.get("spreadsheet", "")).strip():
+    if not str(gs.get("spreadsheet", "")).strip() and not DEFAULT_SPREADSHEET_URL:
         return False, (
             'Falta spreadsheet = "URL de la hoja" dentro de [connections.gsheets] '
             "(debe ir debajo del encabezado [connections.gsheets], no arriba). "

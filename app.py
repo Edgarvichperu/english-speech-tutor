@@ -488,7 +488,7 @@ def gen(contents, json_mode=False, temperature=0.2, retries=3):
     last_err = None
     for attempt in range(retries):
         try:
-            return client.models.generate_content(model=MODEL_NAME, contents=contents, config=cfg)
+            return client.models.generate_content(model="gemini-3.8-flash", contents=contents, config=cfg)
         except Exception as e:
             last_err = e
             if any(k in str(e) for k in ("503", "UNAVAILABLE", "429")) and attempt < retries - 1:

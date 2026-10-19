@@ -28,9 +28,8 @@ st.set_page_config(
     page_icon="🇬🇧",
 )
 
-DEFAULT_SPREADSHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/1ZIoxtogVHKBbFApxDVLE1b8OfxOIxIBdNdPMkE_-mro/edit"
-)
+# La URL de la hoja se define SOLO en los Secrets ([connections.gsheets] spreadsheet = "...").
+DEFAULT_SPREADSHEET_URL = ""
 ROSTER_TAB = "speech"
 LEDGER_TAB = "speech_logs"
 LEDGER_COLUMNS = [
@@ -83,7 +82,7 @@ def get_gsheets_conn():
 
 
 MODEL_NAME = _secret("MODEL_NAME", "gemini-2.5-flash")
-INSTRUCTOR_KEY = _secret("INSTRUCTOR_KEY", "peru2026")
+INSTRUCTOR_KEY = _secret("INSTRUCTOR_KEY")  # sin valor por defecto: si falta, el panel queda desactivado
 
 # ==============================================================================
 # 2. ESTADO DE SESIÓN
@@ -164,19 +163,45 @@ def init_db():
 init_db()
 
 
-def sheets_write_enabled() -> bool:
+def sheets_write_status():
+    """Devuelve (ok, motivo). Solo menciona NOMBRES de claves, nunca valores."""
     try:
-        return str(st.secrets["connections"]["gsheets"].get("type", "")) == "service_account"
+        conns = st.secrets["connections"]
+    except Exception as e:
+        return False, (
+            f"No encuentro la sección [connections] en los secrets ({type(e).__name__}). "
+            "En Streamlit Cloud se configura en Settings > Secrets (el archivo secrets.toml del repositorio no se sube)."
+        )
+    try:
+        gs = conns["gsheets"]
     except Exception:
-        return False
+        return False, f"No existe [connections.gsheets]. Secciones encontradas: {list(conns.keys())}"
+    keys = list(gs.keys())
+    if str(gs.get("type", "")) != "service_account":
+        return False, f'Falta type = "service_account" dentro de [connections.gsheets]. Claves encontradas: {keys}'
+    if not str(gs.get("spreadsheet", "")).strip():
+        return False, (
+            'Falta spreadsheet = "URL de la hoja" dentro de [connections.gsheets] '
+            "(debe ir debajo del encabezado [connections.gsheets], no arriba). "
+            f"Claves encontradas: {keys}"
+        )
+    missing = [k for k in ("project_id", "private_key", "client_email") if not gs.get(k)]
+    if missing:
+        return False, f"Faltan campos de la cuenta de servicio: {missing}"
+    return True, "ok"
+
+
+def sheets_write_enabled() -> bool:
+    return sheets_write_status()[0]
 
 
 def append_to_ledger(row: dict):
     target_url = SPREADSHEET_URL or DEFAULT_SPREADSHEET_URL
     if not target_url:
         return "Falta la URL de Google Sheets."
-    if not sheets_write_enabled():
-        return "Escritura desactivada: falta la cuenta de servicio en los secretos."
+    ok, reason = sheets_write_status()
+    if not ok:
+        return f"Escritura desactivada: {reason}"
     try:
         conn = get_gsheets_conn()
         try:
@@ -276,6 +301,8 @@ def _public_csv_url(sheet_url: str, tab: str) -> str:
 @st.cache_data(ttl=120, show_spinner=False)
 def load_roster(sheet_url: str):
     target_url = _clean_sheet_url(sheet_url) or SPREADSHEET_URL or DEFAULT_SPREADSHEET_URL
+    if not target_url:
+        raise ValueError('Falta la URL de la hoja: agrega spreadsheet = "..." en [connections.gsheets] de los Secrets.')
     errors = []
     try:
         conn = get_gsheets_conn()
@@ -392,6 +419,9 @@ with st.sidebar:
                 "**Sheets Writing:** "
                 + ("✅ Service Account connected" if sheets_write_enabled() else "⚠️ Local SQLite only")
             )
+            _ok, _reason = sheets_write_status()
+            if not _ok:
+                st.error(f"Why writing is disabled: {_reason}")
             if st.session_state.ledger_error:
                 st.warning(f"Last Sheets write warning: {st.session_state.ledger_error}")
             if st.button("🧪 Write a test row to the ledger"):
@@ -761,7 +791,7 @@ if "Guided" in st.session_state.app_mode:
         render_chat(st.session_state.chat_messages)
         st.markdown("---")
         st.info("Good effort! Would you like to practice this passage again or try a new one?")
-        col_a, col_b = col_b = st.columns(2)
+        col_a, col_b = st.columns(2)
         with col_a:
             if st.button("🔁 Repeat This Story", use_container_width=True):
                 total = len(st.session_state.questions_list)
